@@ -102,3 +102,19 @@ func TestUncertainOutboundPausesRoomAndRejectsWrongSender(t *testing.T) {
 		t.Fatal("uncertain send mirrored a duplicate")
 	}
 }
+
+func TestAutomaticBootstrapPreservesAlreadyLoadedLogin(t *testing.T) {
+	mx := &matrixFixture{names: map[id.RoomID]string{}}
+	br, c := startFixture(t, filepath.Join(t.TempDir(), "bridge.db"), mx)
+	defer br.Stop()
+	c.connector.Config.AutoLoginUser = string(c.login.UserMXID)
+	c.connector.Config.Since = "2030-01-01T00:00:00Z"
+	// Fixture backend directories contain no collector. Success proves bootstrap
+	// reused framework-owned state instead of starting a competing source refresh.
+	if err := c.connector.AutoLogin(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c.login.Metadata.(*LoginMetadata).Since != 150 {
+		t.Fatal("activation boundary changed")
+	}
+}

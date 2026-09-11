@@ -2,7 +2,7 @@
 
 ## Automated evidence
 
-`go test -race -tags goolm ./...` passes 17 tests covering:
+`go test -race -tags goolm ./...` passes 18 tests covering:
 
 - version/account/identity validation, hidden-role rejection, old updated conversations,
   activation cutoff, title-independent identity and namespace separation;
@@ -15,7 +15,9 @@
   including encrypted event paths and the Beeper URL prefix;
 - a durable outbound record before submission, restoration after a simulated process
   crash, mapping back to the original Matrix event, and suppression of its echo;
-- wrong-sender rejection and pausing a room when outbound delivery remains uncertain.
+- wrong-sender rejection and pausing a room when outbound delivery remains uncertain;
+- automatic bootstrap reusing an already-loaded login without racing the collector
+  or changing the persisted activation boundary.
 
 The shared backend separately passes 31 Python collector/feed tests and 118 selected
 Node launcher/history/sender tests. Seven sender tests cover request validation,

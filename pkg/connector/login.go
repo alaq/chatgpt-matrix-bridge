@@ -18,6 +18,11 @@ func (c *Connector) AutoLogin(ctx context.Context) error {
 	if err != nil || user == nil || !user.Permissions.Login {
 		return errors.New("auto_login_user must have explicit login permission")
 	}
+	// The framework already loads and connects persisted logins. Starting another
+	// bootstrap refresh here races its poll for the collector's exclusive lock.
+	if len(user.GetUserLogins()) > 0 {
+		return nil
+	}
 	_, err = (&loginProcess{connector: c, user: user}).Start(ctx)
 	return err
 }
