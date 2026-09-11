@@ -28,6 +28,8 @@ remain planned source adapters.
   Failed polls back off from at least one minute to 15 minutes (or a longer configured
   interval). Last captured, account-bound history remains available for local delivery
   and presentation updates while refresh is unavailable; status stays disconnected.
+  A transient refresh failure does not invalidate the configured login or discard
+  follow-ups. Actual sending still verifies the fresh source account before submission.
 - Visible user and assistant text is mirrored. Attachment counts link the reader
   back to the original conversation. Hidden reasoning, raw nodes, and attachment
   credentials are not exported.
@@ -140,7 +142,9 @@ unchanged.
 
 Only the operator's plain text messages in verified source rooms are accepted.
 Replies, edits, attachments and relayed senders are rejected in this pilot. Text is
-limited to 12,000 UTF-8 bytes. A private durable outbox records the original Matrix
+limited to 12,000 UTF-8 bytes. Multiline text is supported. Successful sends request
+an immediate refresh after their original Matrix event is saved, so a slower idle
+polling interval does not delay fetching the answer. A private durable outbox records the original Matrix
 event before calling the backend. The backend writes a submission journal before
 clicking Send, verifies the accepted source message and reconciles repeated calls
 with the same transaction ID. An unresolved attempt pauses the room; sending a new

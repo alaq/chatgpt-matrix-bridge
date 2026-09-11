@@ -76,7 +76,7 @@ func (c *Client) recoverOutbound(ctx context.Context, portal *bridgev2.Portal) e
 		return err
 	}
 	if existing != nil {
-		return c.setOutbound(ctx, portal, nil)
+		return c.finishRecovery(ctx, portal, out)
 	}
 	if !c.connector.Config.SendEnabled {
 		return errors.New("outbound recovery is paused while sending is disabled")
@@ -94,6 +94,13 @@ func (c *Client) recoverOutbound(ctx context.Context, portal *bridgev2.Portal) e
 	if err = c.connector.br.DB.Message.Insert(ctx, msg); err != nil {
 		return errors.New("failed to recover source-to-Matrix message association")
 	}
+	return c.finishRecovery(ctx, portal, out)
+}
+
+func (c *Client) finishRecovery(ctx context.Context, portal *bridgev2.Portal, out *outbound) error {
+	c.connector.br.Matrix.SendMessageStatus(ctx, &bridgev2.MessageStatus{Status: event.MessageStatusSuccess}, &bridgev2.MessageStatusEventInfo{
+		RoomID: portal.MXID, SourceEventID: out.MatrixEvent, Sender: out.Sender, EventType: event.EventMessage, MessageType: event.MsgText,
+	})
 	return c.setOutbound(ctx, portal, nil)
 }
 func sendError(message string, certain bool) error {
@@ -135,9 +142,29 @@ func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMe
 		if err := c.setOutbound(ctx, msg.Portal, nil); err != nil {
 			return nil, sendError("The send was rejected but its local state needs reconciliation.", false)
 		}
-		return nil, sendError("ChatGPT did not accept this send. Check the signed-in session and whether another turn is running.", true)
+		return nil, sendError(rejectedSendMessage(result.Error), true)
 	}
-	return &bridgev2.MatrixMessageResponse{DB: c.outboundMessage(msg.Portal, out, result.UserMessageID), PostSave: func(ctx context.Context, _ *database.Message) { _ = c.setOutbound(ctx, msg.Portal, nil) }}, nil
+	return &bridgev2.MatrixMessageResponse{DB: c.outboundMessage(msg.Portal, out, result.UserMessageID), PostSave: func(ctx context.Context, _ *database.Message) {
+		_ = c.setOutbound(ctx, msg.Portal, nil)
+		c.requestRefresh()
+	}}, nil
+}
+
+func rejectedSendMessage(code string) string {
+	switch code {
+	case "saved_send_draft_mismatch":
+		return "The ChatGPT editor did not preserve this message exactly. Nothing was submitted; retry the original message after the sender is fixed."
+	case "saved_send_existing_draft":
+		return "This ChatGPT conversation already has a different unsent draft. Resolve it in ChatGPT, then retry this message."
+	case "saved_send_source_busy", "saved_send_busy":
+		return "ChatGPT is still handling another turn. Nothing was submitted; retry this message when that turn finishes."
+	case "saved_send_account_mismatch":
+		return "The browser is signed into a different ChatGPT account. Nothing was submitted."
+	case "saved_send_challenge", "saved_send_login_required":
+		return "ChatGPT needs login or browser verification in the DEV browser. Nothing was submitted; retry this message after completing it."
+	default:
+		return "ChatGPT did not accept this send. Check the signed-in session and whether another turn is running."
+	}
 }
 
 type sourceMessage struct {

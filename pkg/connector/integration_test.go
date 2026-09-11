@@ -66,6 +66,8 @@ func (m *matrixFixture) NewUserIntent(context.Context, id.UserID, string) (bridg
 	return nil, "", nil
 }
 func (m *matrixFixture) SendBridgeStatus(context.Context, *status.BridgeState) error { return nil }
+func (m *matrixFixture) SendMessageStatus(context.Context, *bridgev2.MessageStatus, *bridgev2.MessageStatusEventInfo) {
+}
 func (m *matrixFixture) GetPowerLevels(context.Context, id.RoomID) (*event.PowerLevelsEventContent, error) {
 	return &event.PowerLevelsEventContent{}, nil
 }

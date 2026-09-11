@@ -32,7 +32,7 @@ print(json.dumps({'version':1,'source':'chatgpt','account_key':'` + strings.Repe
 	if err := c.poll(context.Background()); err == nil {
 		t.Fatal("failed refresh reported success")
 	}
-	if mx.rooms != 1 || mx.messages != 1 || c.IsLoggedIn() {
+	if mx.rooms != 1 || mx.messages != 1 || !c.IsLoggedIn() || c.connected.Load() {
 		t.Fatal("cached delivery or connection status wrong")
 	}
 	if err := c.poll(context.Background()); err == nil {
@@ -40,6 +40,10 @@ print(json.dumps({'version':1,'source':'chatgpt','account_key':'` + strings.Repe
 	}
 	if mx.messages != 1 {
 		t.Fatal("stale snapshot duplicated messages")
+	}
+	c.LogoutRemote(context.Background())
+	if c.IsLoggedIn() {
+		t.Fatal("explicit logout left the login active")
 	}
 }
 

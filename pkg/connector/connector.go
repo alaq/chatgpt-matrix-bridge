@@ -68,21 +68,25 @@ func (c *Connector) LoadUserLogin(_ context.Context, login *bridgev2.UserLogin) 
 	if !ok || string(login.ID) != "chatgpt_"+meta.AccountKey || meta.Since <= 0 {
 		return errors.New("invalid saved login identity")
 	}
-	login.Client = &Client{login: login, connector: c, backend: c.Config.Backend(), chats: map[string]source.Conversation{}}
+	client := &Client{login: login, connector: c, backend: c.Config.Backend(), chats: map[string]source.Conversation{}, refreshRequested: make(chan struct{}, 1)}
+	client.loginValid.Store(true)
+	login.Client = client
 	return nil
 }
 
 type Client struct {
-	login     *bridgev2.UserLogin
-	connector *Connector
-	backend   source.Backend
-	connected atomic.Bool
-	pollMu    sync.Mutex
-	lifecycle sync.Mutex
-	cancel    context.CancelFunc
-	cacheMu   sync.RWMutex
-	chats     map[string]source.Conversation
-	sendFunc  func(context.Context, source.SendRequest) (*source.SendResult, error)
+	login            *bridgev2.UserLogin
+	connector        *Connector
+	backend          source.Backend
+	connected        atomic.Bool
+	loginValid       atomic.Bool
+	pollMu           sync.Mutex
+	lifecycle        sync.Mutex
+	cancel           context.CancelFunc
+	cacheMu          sync.RWMutex
+	chats            map[string]source.Conversation
+	refreshRequested chan struct{}
+	sendFunc         func(context.Context, source.SendRequest) (*source.SendResult, error)
 }
 
 var _ bridgev2.NetworkAPI = (*Client)(nil)
@@ -116,9 +120,18 @@ func (c *Client) Connect(ctx context.Context) {
 				timer.Stop()
 				return
 			case <-timer.C:
+			case <-c.refreshRequested:
+				timer.Stop()
 			}
 		}
 	}()
+}
+
+func (c *Client) requestRefresh() {
+	select {
+	case c.refreshRequested <- struct{}{}:
+	default:
+	}
 }
 func (c *Client) Disconnect() {
 	c.lifecycle.Lock()
@@ -129,8 +142,12 @@ func (c *Client) Disconnect() {
 	}
 	c.connected.Store(false)
 }
-func (c *Client) IsLoggedIn() bool                                       { return c.connected.Load() }
-func (c *Client) LogoutRemote(context.Context)                           { c.Disconnect() }
+
+// A persisted collector login remains configured across transient sync failures.
+// Every actual send independently verifies the fresh source account before any UI
+// submission. Sync health must not make bridgev2 discard the owner's follow-up.
+func (c *Client) IsLoggedIn() bool                                       { return c.loginValid.Load() }
+func (c *Client) LogoutRemote(context.Context)                           { c.loginValid.Store(false); c.Disconnect() }
 func (c *Client) IsThisUser(_ context.Context, id networkid.UserID) bool { return id == c.userID() }
 func (c *Client) userID() networkid.UserID                               { return networkid.UserID(string(c.login.ID) + "_user") }
 func (c *Client) assistantID() networkid.UserID {
