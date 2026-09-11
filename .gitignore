@@ -1,0 +1,10 @@
+/bin/
+/config.yaml
+/registration.yaml
+*.db
+*.db-*
+*.sqlite*
+*.log
+.env
+/.runtime/
+/private/
