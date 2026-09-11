@@ -29,6 +29,8 @@ type matrixFixture struct {
 	mu       sync.Mutex
 	rooms    int
 	messages int
+	uploads  int
+	contents []*event.MessageEventContent
 	names    map[id.RoomID]string
 	failNext bool
 }
@@ -102,7 +104,7 @@ func (i *intentFixture) SendState(_ context.Context, room id.RoomID, typ event.T
 	}
 	return &mautrix.RespSendEvent{EventID: "$state"}, nil
 }
-func (i *intentFixture) SendMessage(_ context.Context, _ id.RoomID, _ event.Type, _ *event.Content, _ *bridgev2.MatrixSendExtra) (*mautrix.RespSendEvent, error) {
+func (i *intentFixture) SendMessage(_ context.Context, _ id.RoomID, _ event.Type, content *event.Content, _ *bridgev2.MatrixSendExtra) (*mautrix.RespSendEvent, error) {
 	i.mx.mu.Lock()
 	defer i.mx.mu.Unlock()
 	if i.mx.failNext {
@@ -110,7 +112,18 @@ func (i *intentFixture) SendMessage(_ context.Context, _ id.RoomID, _ event.Type
 		return nil, fmt.Errorf("injected pre-send failure")
 	}
 	i.mx.messages++
+	if parsed, ok := content.Parsed.(*event.MessageEventContent); ok {
+		copyContent := *parsed
+		i.mx.contents = append(i.mx.contents, &copyContent)
+	}
 	return &mautrix.RespSendEvent{EventID: id.EventID(fmt.Sprintf("$message%d", i.mx.messages))}, nil
+}
+
+func (i *intentFixture) UploadMedia(context.Context, id.RoomID, []byte, string, string) (id.ContentURIString, *event.EncryptedFileInfo, error) {
+	i.mx.mu.Lock()
+	defer i.mx.mu.Unlock()
+	i.mx.uploads++
+	return "mxc://test.invalid/chatgpt", nil, nil
 }
 
 func startFixture(t *testing.T, path string, mx *matrixFixture) (*bridgev2.Bridge, *Client) {

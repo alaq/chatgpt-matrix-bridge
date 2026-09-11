@@ -2,7 +2,7 @@
 
 ## Automated evidence
 
-`go test -race -tags goolm ./...` passes 18 tests covering:
+`go test -race -tags goolm ./...` covers:
 
 - version/account/identity validation, hidden-role rejection, old updated conversations,
   activation cutoff, title-independent identity and namespace separation;
@@ -18,8 +18,15 @@
 - wrong-sender rejection and pausing a room when outbound delivery remains uncertain;
 - automatic bootstrap reusing an already-loaded login without racing the collector
   or changing the persisted activation boundary.
+- Markdown rendering, code escaping, citations, unsafe URLs and mention suppression;
+- in-place assistant presentation migration through the real framework, failure/retry,
+  restart deduplication, preserved original event identity, and continued rejection of
+  source edits; migration uses a stable transaction distinct from the original send;
+- one cached icon upload across restarts, shared by the bot, network and source rooms.
+- a failed source refresh still delivering the verified archive without claiming a
+  successful sync, plus bounded exponential backoff and reset after recovery.
 
-The shared backend separately passes 31 Python collector/feed tests and 118 selected
+The shared backend separately passes 33 Python collector/feed tests and 118 selected
 Node launcher/history/sender tests. Seven sender tests cover request validation,
 receipt reuse after restart, lost browser responses, uncertain-send blocking,
 source account/head changes, ambiguous source candidates and private journal files.

@@ -22,6 +22,7 @@ import (
 type Connector struct {
 	br     *bridgev2.Bridge
 	Config Config
+	icon   atomic.Value // id.ContentURIString; GetName is also called during startup.
 }
 
 var _ bridgev2.NetworkConnector = (*Connector)(nil)
@@ -30,18 +31,21 @@ func (c *Connector) Init(br *bridgev2.Bridge) {
 	bridgev2.PortalEventBuffer = 0
 	c.br = br
 }
-func (c *Connector) Start(context.Context) error {
+func (c *Connector) Start(ctx context.Context) error {
 	if c.br.Config.AsyncEvents || !c.br.Config.SplitPortals {
 		return errors.New("this bridge requires bridge.async_events=false and bridge.split_portals=true")
 	}
-	return c.Config.validate()
+	if err := c.Config.validate(); err != nil {
+		return err
+	}
+	return c.initializeIcon(ctx)
 }
-func (c *Connector) GetBridgeInfoVersion() (int, int) { return 1, 1 }
+func (c *Connector) GetBridgeInfoVersion() (int, int) { return 2, 1 }
 func (c *Connector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 	return &bridgev2.NetworkGeneralCapabilities{}
 }
 func (c *Connector) GetName() bridgev2.BridgeName {
-	return bridgev2.BridgeName{DisplayName: "ChatGPT", NetworkURL: "https://chatgpt.com", NetworkID: "chatgpt", BeeperBridgeType: "github.com/alaq/chatgpt-matrix-bridge", DefaultPort: 29345}
+	return bridgev2.BridgeName{DisplayName: "ChatGPT", NetworkURL: "https://chatgpt.com", NetworkIcon: c.iconURI(), NetworkID: "chatgpt", BeeperBridgeType: "github.com/alaq/chatgpt-matrix-bridge", DefaultPort: 29345}
 }
 func (c *Connector) GetConfig() (string, any, configupgrade.Upgrader) {
 	return exampleConfig, &c.Config, configupgrade.SimpleUpgrader(upgradeConfig)
@@ -55,7 +59,8 @@ type LoginMetadata struct {
 	Since      float64 `json:"since"`
 }
 type MessageMetadata struct {
-	Hash string `json:"hash"`
+	Hash             string `json:"hash"`
+	PresentationHash string `json:"presentation_hash,omitempty"`
 }
 
 func (c *Connector) LoadUserLogin(_ context.Context, login *bridgev2.UserLogin) error {
@@ -90,24 +95,27 @@ func (c *Client) Connect(ctx context.Context) {
 	}
 	ctx, c.cancel = context.WithCancel(ctx)
 	go func() {
-		ticker := time.NewTicker(time.Duration(c.connector.Config.PollSeconds) * time.Second)
-		defer ticker.Stop()
+		failures := 0
 		for {
 			if err := c.poll(ctx); err != nil {
 				if ctx.Err() != nil {
 					return
 				}
+				failures++
 				c.connected.Store(false)
 				c.login.Log.Warn().Err(err).Msg("ChatGPT source synchronization paused")
-				c.login.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "chatgpt-source-unavailable", Message: "Check the signed-in collector and source account; the next poll will retry."})
+				c.login.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "chatgpt-source-unavailable", Message: "Source refresh is unavailable. Showing the last saved history; retries will back off automatically."})
 			} else {
+				failures = 0
 				c.connected.Store(true)
 				c.login.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 			}
+			timer := time.NewTimer(nextPollDelay(time.Duration(c.connector.Config.PollSeconds)*time.Second, failures))
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
-			case <-ticker.C:
+			case <-timer.C:
 			}
 		}
 	}()
@@ -129,15 +137,21 @@ func (c *Client) assistantID() networkid.UserID {
 	return networkid.UserID(string(c.login.ID) + "_assistant")
 }
 
-func (c *Client) poll(ctx context.Context) error {
+func (c *Client) poll(ctx context.Context) (result error) {
 	c.pollMu.Lock()
 	defer c.pollMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := c.backend.Refresh(ctx); err != nil {
-		return err
-	}
+	refreshErr := c.backend.Refresh(ctx)
+	// The account-bound archive remains useful while the source is unavailable.
+	// Finish local delivery/presentation updates, but report the refresh failure
+	// and back off instead of claiming that the source is synchronized.
+	defer func() { result = errors.Join(refreshErr, result) }()
+	return c.deliverArchive(ctx)
+}
+
+func (c *Client) deliverArchive(ctx context.Context) error {
 	snapshot, err := c.backend.Read(ctx)
 	if err != nil {
 		return err
@@ -165,6 +179,17 @@ func (c *Client) poll(ctx context.Context) error {
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func nextPollDelay(normal time.Duration, failures int) time.Duration {
+	if failures == 0 {
+		return normal
+	}
+	delay := max(normal, time.Minute)
+	for i := 1; i < failures && delay < 15*time.Minute; i++ {
+		delay *= 2
+	}
+	return max(normal, min(delay, 15*time.Minute))
 }
 
 func (c *Client) dispatch(ctx context.Context, chat source.Conversation) error {
@@ -205,7 +230,11 @@ func (c *Client) GetUserInfo(_ context.Context, ghost *bridgev2.Ghost) (*bridgev
 	} else if ghost.ID != c.assistantID() {
 		return nil, errors.New("unknown ChatGPT sender")
 	}
-	return &bridgev2.UserInfo{Name: ptr.Ptr(name)}, nil
+	info := &bridgev2.UserInfo{Name: ptr.Ptr(name)}
+	if ghost.ID == c.assistantID() {
+		info.Avatar = c.connector.avatar()
+	}
+	return info, nil
 }
 func (c *Client) GetCapabilities(context.Context, *bridgev2.Portal) *event.RoomFeatures {
 	if c.connector.Config.SendEnabled {

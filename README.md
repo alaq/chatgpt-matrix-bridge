@@ -25,9 +25,21 @@ remain planned source adapters.
   relogin; set `network.since` before first login to include an older window.
 - Each poll runs the existing bounded incremental collector, then reads a snapshot.
   Default polling is 60 seconds plus collection/delivery time, not a latency SLA.
+  Failed polls back off from at least one minute to 15 minutes (or a longer configured
+  interval). Last captured, account-bound history remains available for local delivery
+  and presentation updates while refresh is unavailable; status stays disconnected.
 - Visible user and assistant text is mirrored. Attachment counts link the reader
   back to the original conversation. Hidden reasoning, raw nodes, and attachment
   credentials are not exported.
+- The ChatGPT participant, rooms, bridge bot and network metadata use a bundled
+  icon, uploaded once per homeserver/database and reused across restarts.
+- Assistant Markdown is sent as Matrix HTML: bold, lists, links, tables and fenced
+  code blocks. Source HTML is escaped, unsafe Markdown URLs are disabled and no
+  mention notifications are generated. User messages retain their original text.
+- Web citation markers become source links when the feed includes `citation_groups`.
+  Unresolved citations link to the original ChatGPT conversation. Existing assistant
+  messages receive an idempotent presentation edit; their event IDs and source hashes
+  stay unchanged. Ordinary source text edits remain unsupported.
 
 ## Build and test
 

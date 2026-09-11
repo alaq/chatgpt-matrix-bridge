@@ -1,8 +1,6 @@
 package connector
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"github.com/alaq/chatgpt-matrix-bridge/internal/source"
 	"go.mau.fi/util/ptr"
@@ -20,9 +18,9 @@ func (c *Client) chatInfo(chat source.Conversation) *bridgev2.ChatInfo {
 	if len([]rune(name)) > 200 {
 		name = string([]rune(name)[:200])
 	}
-	return &bridgev2.ChatInfo{Name: ptr.Ptr(name), Topic: ptr.Ptr(chat.URL), Type: ptr.Ptr(database.RoomTypeDefault), JoinRule: &event.JoinRulesEventContent{JoinRule: event.JoinRuleInvite}, Members: &bridgev2.ChatMemberList{IsFull: true, Members: []bridgev2.ChatMember{
+	return &bridgev2.ChatInfo{Name: ptr.Ptr(name), Avatar: c.connector.avatar(), Topic: ptr.Ptr(chat.URL), Type: ptr.Ptr(database.RoomTypeDefault), JoinRule: &event.JoinRulesEventContent{JoinRule: event.JoinRuleInvite}, Members: &bridgev2.ChatMemberList{IsFull: true, Members: []bridgev2.ChatMember{
 		{EventSender: bridgev2.EventSender{IsFromMe: true, Sender: c.userID(), SenderLogin: c.login.ID}, Membership: event.MembershipJoin, PowerLevel: ptr.Ptr(50)},
-		{EventSender: bridgev2.EventSender{Sender: c.assistantID()}, Membership: event.MembershipJoin, PowerLevel: ptr.Ptr(50)},
+		{EventSender: bridgev2.EventSender{Sender: c.assistantID()}, UserInfo: &bridgev2.UserInfo{Name: ptr.Ptr("ChatGPT"), Avatar: c.connector.avatar()}, Membership: event.MembershipJoin, PowerLevel: ptr.Ptr(50)},
 	}}, ExcludeChangesFromTimeline: true}
 }
 
@@ -49,19 +47,18 @@ func (c *Client) events(chat source.Conversation) []bridgev2.RemoteEvent {
 			body = "[Empty message]"
 		}
 		hash := source.StableID(m.Role, body)
+		content := renderMessage(m, body, chat.URL)
+		metadata := &MessageMetadata{Hash: hash}
+		if m.Role == "assistant" {
+			metadata.PresentationHash = presentationHash(content)
+		}
+		messageID := networkid.MessageID(source.MessageID(account, chat.ID, m.ID))
+		messageMeta := meta.WithType(bridgev2.RemoteEventMessageUpsert).WithSender(sender).WithTimestamp(time.UnixMilli(int64(ts * 1000)))
 		result = append(result, &sourceMessage{client: c, PreConvertedMessage: &simplevent.PreConvertedMessage{
-			EventMeta: meta.WithType(bridgev2.RemoteEventMessageUpsert).WithSender(sender).WithTimestamp(time.UnixMilli(int64(ts * 1000))),
-			ID:        networkid.MessageID(source.MessageID(account, chat.ID, m.ID)),
-			Data:      &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{Type: event.EventMessage, Content: &event.MessageEventContent{MsgType: event.MsgText, Body: body, Mentions: &event.Mentions{}}, DBMetadata: &MessageMetadata{Hash: hash}}}},
-			HandleExistingFunc: func(_ context.Context, _ *bridgev2.Portal, _ bridgev2.MatrixAPI, existing []*database.Message) (bridgev2.UpsertResult, error) {
-				for _, part := range existing {
-					meta, ok := part.Metadata.(*MessageMetadata)
-					if !ok || meta.Hash != hash {
-						return bridgev2.UpsertResult{}, errors.New("source message edited; edit reconciliation is not implemented in this pilot")
-					}
-				}
-				return bridgev2.UpsertResult{}, nil
-			},
+			EventMeta:          messageMeta,
+			ID:                 messageID,
+			Data:               &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{Type: event.EventMessage, Content: content, DBMetadata: metadata}}},
+			HandleExistingFunc: presentationUpsert(messageMeta, messageID, m.Role, body, hash, content),
 		}})
 	}
 	return result

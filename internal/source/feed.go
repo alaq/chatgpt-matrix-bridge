@@ -24,11 +24,22 @@ var accountPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var idPattern = regexp.MustCompile(`^[a-fA-F0-9]{8}(-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$`)
 
 type Message struct {
-	ID              string   `json:"id"`
-	Role            string   `json:"role"`
-	Text            string   `json:"text"`
-	CreatedAt       *float64 `json:"created_at"`
-	AttachmentCount int      `json:"attachment_count"`
+	ID              string          `json:"id"`
+	Role            string          `json:"role"`
+	Text            string          `json:"text"`
+	CreatedAt       *float64        `json:"created_at"`
+	AttachmentCount int             `json:"attachment_count"`
+	CitationGroups  []CitationGroup `json:"citation_groups,omitempty"`
+}
+
+type CitationSource struct {
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
+type CitationGroup struct {
+	Marker  string           `json:"marker"`
+	Sources []CitationSource `json:"sources"`
 }
 
 type Conversation struct {
