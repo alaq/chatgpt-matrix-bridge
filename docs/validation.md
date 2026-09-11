@@ -1,38 +1,65 @@
-# Validation and next live proof
+# Validation
 
 ## Automated evidence
 
-`go test -race -tags goolm ./...` exercises:
+`go test -race -tags goolm ./...` passes 17 tests covering:
 
-- version/account/identity validation and hidden-role rejection;
-- old conversations updated after activation and historical cutoff behavior;
-- title-independent room identity and account/message namespace separation;
-- bounded backend subprocess output, private-error suppression, and cancellation;
-- automatic room creation, including an empty conversation;
-- correct user/assistant attribution and explicit unsupported outbound messages;
-- the real bridgev2 SQLite database across first discovery, identical replay, restart,
-  continued conversation, title change, and a different conversation with the same title;
-- injected pre-send failure, retry without advancing to later messages, and detection
-  of unsupported source edits.
+- version/account/identity validation, hidden-role rejection, old updated conversations,
+  activation cutoff, title-independent identity and namespace separation;
+- bounded subprocess output, private-error suppression and cancellation;
+- automatic room creation, including empty conversations, and user/assistant attribution;
+- the real bridgev2 SQLite database across discovery, replay, restart, continuation,
+  renaming and equal titles belonging to separate conversations;
+- pre-send failure, ordered retry and detection of unsupported source edits;
+- deterministic Matrix transactions after remote acceptance and loss of the response,
+  including encrypted event paths and the Beeper URL prefix;
+- a durable outbound record before submission, restoration after a simulated process
+  crash, mapping back to the original Matrix event, and suppression of its echo;
+- wrong-sender rejection and pausing a room when outbound delivery remains uncertain.
 
-The Matrix network in integration tests is a fixture. These tests make no live
-homeserver writes. Source-check separately reads the real local collector through
-its public feed contract and prints counts only.
+The shared backend separately passes 31 Python collector/feed tests and 118 selected
+Node launcher/history/sender tests. Seven sender tests cover request validation,
+receipt reuse after restart, lost browser responses, uncertain-send blocking,
+source account/head changes, ambiguous source candidates and private journal files.
+The original Temporary Chat browser ownership tests still pass. Go vet and builds pass.
 
-## Live proof still required
+These automated tests use fixtures for Matrix and browser side effects. The live
+checks below are separate evidence, not inferred from mock results.
 
-1. Configure a separate private, encrypted test bridge; confirm the intended
-   homeserver, operator account, and room membership.
-2. Use an explicitly chosen synthetic ChatGPT test conversation. Confirm automatic
-   discovery creates exactly one room visible in Beeper, with source URL and text.
-3. Continue from ChatGPT web/mobile and verify the same room receives the new turn.
-4. Restart the service and verify no new rooms or repeated acknowledged messages.
-5. Inject a connection failure and an accept-before-local-commit interruption.
-   Resolve uncertain Matrix delivery before claiming reliable unattended sync.
-6. Implement saved-thread sending and test one Matrix-originated turn, its answer,
-   reload in ChatGPT, concurrent web activity, and outbound echo suppression.
+## Live evidence — September 11, 2026
 
-Live room creation/delivery, encryption interoperability, saved-thread outbound,
-branch/edit/deletion reconciliation, attachments, and Work/Codex support are not
-implied by successful local tests. Broad automatic mirroring should follow the
-bounded live proof; source access and Matrix delivery have independent state.
+- Registered a dedicated Beeper bridge using bbctl's existing Desktop login.
+- Connected via the appservice websocket and bootstrapped only the configured operator.
+- Automatically created an invite-only room for an existing synthetic saved ChatGPT
+  conversation. Its six existing visible messages were readable in Beeper.
+- Submitted a fresh prompt through the saved UI adapter, verified its source message
+  ID and completed answer, and observed both in the same Beeper room.
+- Replayed the exact transaction and received the existing source receipt without
+  another UI submission.
+- Observed a Matrix-originated message from the operator's Beeper account, matched
+  its original Matrix event to the backend transaction and saved ChatGPT user-message
+  ID, and verified the answer returned to the same room without an echoed user copy.
+- Continued the source again after a restart. Both new events were `m.room.encrypted`
+  on the homeserver, readable in Beeper, and carried stable `chatgpt_` transactions.
+  This includes the separate connection used to mirror messages as the operator.
+- Removed the pilot conversation filter after setting the persisted update cutoff
+  to actual first live activation. A different, newly created ordinary ChatGPT
+  conversation appeared in a second encrypted room automatically, without pairing.
+
+Private source IDs, room IDs, credentials, snapshots and runtime files are kept
+outside this repository. The personal project note holds the private evidence chain.
+No new vault project was created for the ordinary conversation.
+
+## Remaining coverage
+
+- Measure normal discovery latency over several updates and test mobile explicitly.
+  The current interval is configurable; collection/delivery time adds to it.
+- Test sustained operation, browser session expiry/recovery and simultaneous activity.
+- The transaction fix covers message replay in the same Matrix sender/token/device
+  scope. Token/device resets and accept-before-local-commit room creation are distinct
+  recovery cases; exactly-once delivery is not claimed.
+- Existing message edits pause their room. Branch/deletion reconciliation, attachment
+  binaries, project-only/archived-only discovery and exhaustive history need more work.
+- The current local processes run continuously, but no login/startup supervisor has
+  been installed. Keep the browser session, bridge database and sender journal together.
+- Work and Codex discovery/continuation remain stretch sources.

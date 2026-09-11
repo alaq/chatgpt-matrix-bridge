@@ -32,17 +32,28 @@ Synchronous portal processing preserves order and stops a conversation at the fi
 failed message; other conversations can continue. A canceled poll cancels its
 backend subprocess and in-flight delivery. Relogin preserves the activation time.
 
-The first implementation uses `RemoteEventMessageUpsert` to detect changed text on
-an existing source message ID. Unsupported edits surface an error for that room.
-The framework owns successful-message records. Room creation, normal restarts, and
-known pre-send failures are tested against its actual SQLite store. Its default
-Matrix sender does not close the accept-before-database-write ambiguity window;
-that remains a deployment gate for robust unattended use.
+Source messages use `RemoteEventMessageUpsert` to detect changed text on an existing
+source ID. Unsupported edits surface an error for that room. The framework owns
+successful-message records. A narrowly scoped HTTP transport assigns stable
+transaction IDs to each single-part source timeline message, after mautrix handles
+encryption. Both appservice ghost clients and separate custom-user clients are
+wrapped. State changes, receipts, reactions and ordinary bot messages retain their
+normal behavior. The transaction key depends on room and source message identity,
+never message text or encryption randomness.
 
-The future outbound adapter must target the real saved ChatGPT conversation ID,
-serialize turns, verify the accepted source message, and reconcile uncertain sends
-before retrying. User messages mirrored back from the source must match the stored
-outbound mapping rather than echoing a second copy.
+Outbound sends enter the original saved ChatGPT thread through a separate DEV UI
+adapter. A durable private bridge outbox records the Matrix event and original text
+before the backend call. The backend journals a transaction and source head before
+clicking Send; it reconciles exactly one matching user child of that head after an
+uncertain response. A retry cannot blindly click again. The selected web model
+handles the prompt; the bridge adds no system instructions or project routing.
+
+The source message's pre-handler runs inside the serialized portal queue. It
+recovers outstanding sends with their original transaction, restores the original
+Matrix-event association, and then permits mirroring. This prevents an outbound
+prompt from echoing back after acceptance followed by a process crash. If recovery
+is uncertain, that room pauses. The private bridge outbox can contain message text;
+the backend journal stores hashes and IDs, not prompts or session credentials.
 
 Work and Codex can implement their own discovery/history/continuation adapters.
 Their APIs and local/cloud scope must be verified independently. Do not label a

@@ -13,7 +13,7 @@ import (
 
 func testClient() *Client {
 	key := strings.Repeat("a", 64)
-	return &Client{login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: networkid.UserLoginID("chatgpt_" + key), Metadata: &LoginMetadata{AccountKey: key, Since: 150}}}}
+	return &Client{connector: &Connector{}, login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: networkid.UserLoginID("chatgpt_" + key), Metadata: &LoginMetadata{AccountKey: key, Since: 150}}}}
 }
 func testChat() source.Conversation {
 	return source.Conversation{ID: "11111111-1111-1111-1111-111111111111", Title: "Question", URL: "https://chatgpt.com/c/11111111-1111-1111-1111-111111111111", CreatedAt: 100, UpdatedAt: 200, Messages: []source.Message{{ID: "u1", Role: "user", Text: "Hello"}, {ID: "a1", Role: "assistant", Text: "Hi"}}}
@@ -55,7 +55,7 @@ func TestContinuationAndRenameReuseRoomAndMessageIDs(t *testing.T) {
 	}
 }
 func TestRepeatIsNoopAndSourceEditsAreReported(t *testing.T) {
-	m := testClient().events(testChat())[1].(*simplevent.PreConvertedMessage)
+	m := testClient().events(testChat())[1].(*sourceMessage)
 	db := []*database.Message{{Metadata: m.Data.Parts[0].DBMetadata}}
 	r, err := m.HandleExisting(context.Background(), nil, nil, db)
 	if err != nil || r.ContinueMessageHandling || len(r.SubEvents) > 0 {
@@ -69,7 +69,7 @@ func TestRepeatIsNoopAndSourceEditsAreReported(t *testing.T) {
 func TestRoleAttributionAndUnsupportedOutbound(t *testing.T) {
 	c := testClient()
 	events := c.events(testChat())
-	if !events[1].(*simplevent.PreConvertedMessage).Sender.IsFromMe || events[2].(*simplevent.PreConvertedMessage).Sender.IsFromMe {
+	if !events[1].(*sourceMessage).Sender.IsFromMe || events[2].(*sourceMessage).Sender.IsFromMe {
 		t.Fatal("source roles mixed")
 	}
 	if _, err := c.HandleMatrixMessage(context.Background(), nil); err == nil {

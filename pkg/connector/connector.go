@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/alaq/chatgpt-matrix-bridge/internal/delivery"
 	"github.com/alaq/chatgpt-matrix-bridge/internal/source"
 	"go.mau.fi/util/configupgrade"
 	"go.mau.fi/util/ptr"
@@ -29,7 +30,12 @@ func (c *Connector) Init(br *bridgev2.Bridge) {
 	bridgev2.PortalEventBuffer = 0
 	c.br = br
 }
-func (c *Connector) Start(context.Context) error      { return c.Config.validate() }
+func (c *Connector) Start(context.Context) error {
+	if c.br.Config.AsyncEvents || !c.br.Config.SplitPortals {
+		return errors.New("this bridge requires bridge.async_events=false and bridge.split_portals=true")
+	}
+	return c.Config.validate()
+}
 func (c *Connector) GetBridgeInfoVersion() (int, int) { return 1, 1 }
 func (c *Connector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 	return &bridgev2.NetworkGeneralCapabilities{}
@@ -71,6 +77,7 @@ type Client struct {
 	cancel    context.CancelFunc
 	cacheMu   sync.RWMutex
 	chats     map[string]source.Conversation
+	sendFunc  func(context.Context, source.SendRequest) (*source.SendResult, error)
 }
 
 var _ bridgev2.NetworkAPI = (*Client)(nil)
@@ -147,6 +154,9 @@ func (c *Client) poll(ctx context.Context) error {
 	c.cacheMu.Unlock()
 	var failures []error
 	for _, chat := range chats {
+		if !c.connector.Config.allows(chat.ID) {
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -167,7 +177,9 @@ func (c *Client) dispatch(ctx context.Context, chat source.Conversation) error {
 		case *simplevent.ChatResync:
 			e.MutateContextFunc = func(context.Context) context.Context { return ctx }
 		case *simplevent.PreConvertedMessage:
-			e.MutateContextFunc = func(context.Context) context.Context { return ctx }
+			e.MutateContextFunc = func(context.Context) context.Context { return delivery.WithMessage(ctx, string(e.ID)) }
+		case *sourceMessage:
+			e.MutateContextFunc = func(context.Context) context.Context { return delivery.WithMessage(ctx, string(e.ID)) }
 		}
 		result := c.login.QueueRemoteEvent(evt)
 		if !result.Success {
@@ -196,8 +208,8 @@ func (c *Client) GetUserInfo(_ context.Context, ghost *bridgev2.Ghost) (*bridgev
 	return &bridgev2.UserInfo{Name: ptr.Ptr(name)}, nil
 }
 func (c *Client) GetCapabilities(context.Context, *bridgev2.Portal) *event.RoomFeatures {
+	if c.connector.Config.SendEnabled {
+		return &event.RoomFeatures{ID: "chatgpt-saved-text-v1", MaxTextLength: 12000, Edit: event.CapLevelRejected, Delete: event.CapLevelRejected, Thread: event.CapLevelRejected, Reply: event.CapLevelRejected}
+	}
 	return &event.RoomFeatures{ID: "chatgpt-readonly-v1"}
-}
-func (c *Client) HandleMatrixMessage(context.Context, *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
-	return nil, bridgev2.WrapErrorInStatus(errors.New("This pilot mirrors ChatGPT conversations. Sending into saved ChatGPT threads is not implemented yet.")).WithIsCertain(true).WithErrorAsMessage()
 }

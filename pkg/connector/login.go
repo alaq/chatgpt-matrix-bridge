@@ -6,8 +6,21 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/id"
 	"time"
 )
+
+func (c *Connector) AutoLogin(ctx context.Context) error {
+	if c.Config.AutoLoginUser == "" {
+		return nil
+	}
+	user, err := c.br.GetUserByMXID(ctx, id.UserID(c.Config.AutoLoginUser))
+	if err != nil || user == nil || !user.Permissions.Login {
+		return errors.New("auto_login_user must have explicit login permission")
+	}
+	_, err = (&loginProcess{connector: c, user: user}).Start(ctx)
+	return err
+}
 
 func (c *Connector) GetLoginFlows() []bridgev2.LoginFlow {
 	return []bridgev2.LoginFlow{{ID: "local-collector", Name: "Local ChatGPT collector", Description: "Use the operator-configured, signed-in local collector"}}

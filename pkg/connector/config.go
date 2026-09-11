@@ -8,13 +8,16 @@ import (
 )
 
 type Config struct {
-	Enabled     bool   `yaml:"enabled"`
-	Python      string `yaml:"python"`
-	BackendDir  string `yaml:"backend_dir"`
-	ArchiveDir  string `yaml:"archive_dir"`
-	Descriptor  string `yaml:"descriptor"`
-	PollSeconds int    `yaml:"poll_seconds"`
-	Since       string `yaml:"since"`
+	Enabled            bool     `yaml:"enabled"`
+	Python             string   `yaml:"python"`
+	BackendDir         string   `yaml:"backend_dir"`
+	ArchiveDir         string   `yaml:"archive_dir"`
+	Descriptor         string   `yaml:"descriptor"`
+	PollSeconds        int      `yaml:"poll_seconds"`
+	Since              string   `yaml:"since"`
+	AllowConversations []string `yaml:"allow_conversations"`
+	SendEnabled        bool     `yaml:"send_enabled"`
+	AutoLoginUser      string   `yaml:"auto_login_user"`
 }
 
 const exampleConfig = `# Enable only after configuring a dedicated private Matrix bridge.
@@ -27,6 +30,12 @@ poll_seconds: 60
 # Empty starts with conversations updated after first login. Persisted across restarts.
 # An explicit RFC3339 date opts into an older window at first login only.
 since: ""
+# Optional bounded pilot; empty discovers all eligible conversations.
+allow_conversations: []
+# Requires the separate saved-send capability in the DEV launcher.
+send_enabled: false
+# Optional single-operator bootstrap; must be allowed to log in by bridge.permissions.
+auto_login_user: ""
 `
 
 func (c Config) Backend() source.Backend {
@@ -52,4 +61,19 @@ func upgradeConfig(h configupgrade.Helper) {
 		h.Copy(configupgrade.Str, k)
 	}
 	h.Copy(configupgrade.Int, "poll_seconds")
+	h.Copy(configupgrade.Bool, "send_enabled")
+	h.Copy(configupgrade.Str, "auto_login_user")
+	h.Copy(configupgrade.List, "allow_conversations")
+}
+
+func (c Config) allows(id string) bool {
+	if len(c.AllowConversations) == 0 {
+		return true
+	}
+	for _, candidate := range c.AllowConversations {
+		if candidate == id {
+			return true
+		}
+	}
+	return false
 }
