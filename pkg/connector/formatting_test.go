@@ -8,10 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/alaq/chatgpt-matrix-bridge/internal/delivery"
 	"github.com/alaq/chatgpt-matrix-bridge/internal/source"
 	"maunium.net/go/mautrix/bridgev2/database"
-	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -21,38 +19,6 @@ type presentationTransport struct{ path string }
 func (p *presentationTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	p.path = r.URL.Path
 	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("{}"))}, nil
-}
-
-func TestPresentationEditHasStableTransactionDistinctFromOriginal(t *testing.T) {
-	chat := testChat()
-	chat.Messages[1].Text = "**Answer**"
-	m := testClient().events(chat)[2].(*sourceMessage)
-	existing := []*database.Message{{Metadata: &MessageMetadata{Hash: source.StableID("assistant", "**Answer**")}}}
-	baseCtx := delivery.WithMessage(context.Background(), string(m.ID))
-	pathFor := func(ctx context.Context) string {
-		capture := &presentationTransport{}
-		req, _ := http.NewRequestWithContext(ctx, "PUT", "https://test.invalid/_hungryserv/owner/_matrix/client/v3/rooms/!room:test/send/m.room.encrypted/random", nil)
-		resp, err := (delivery.Transport{Base: capture}).RoundTrip(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		return capture.path
-	}
-	originalPath := pathFor(baseCtx)
-	var editPath string
-	for attempt := 0; attempt < 2; attempt++ {
-		r, err := m.HandleExisting(baseCtx, nil, nil, existing)
-		if err != nil || len(r.SubEvents) != 1 {
-			t.Fatal("no migration edit")
-		}
-		edit := r.SubEvents[0].(*simplevent.Message[*event.MessageEventContent])
-		path := pathFor(edit.MutateContextFunc(baseCtx))
-		if path == originalPath || (attempt > 0 && path != editPath) {
-			t.Fatal("edit transaction collides or changes on retry")
-		}
-		editPath = path
-	}
 }
 
 func TestAssistantMarkdownAndCodeAreRichText(t *testing.T) {
@@ -116,6 +82,7 @@ func TestFrameworkPresentationMigrationRetriesAndSurvivesRestart(t *testing.T) {
 		t.Fatalf("get original: %v", err)
 	}
 	originalID := parts[0].MXID
+	originalPath := mx.paths[len(mx.paths)-1]
 	parts[0].Metadata.(*MessageMetadata).PresentationHash = ""
 	if err := br.DB.Message.Update(ctx, parts[0]); err != nil {
 		t.Fatal(err)
@@ -129,6 +96,20 @@ func TestFrameworkPresentationMigrationRetriesAndSurvivesRestart(t *testing.T) {
 		t.Fatal("failed edit advanced migration")
 	}
 	feedFixture(t, br, c, chat)
+	if mx.paths[len(mx.paths)-1] == originalPath {
+		t.Fatal("live delivery context reused original transaction for edit")
+	}
+	editPath := mx.paths[len(mx.paths)-1]
+	// Simulate server acceptance followed by lost local commit.
+	parts, _ = br.DB.Message.GetAllPartsByID(ctx, c.login.ID, assistantID)
+	parts[0].Metadata.(*MessageMetadata).PresentationHash = ""
+	if err := br.DB.Message.Update(ctx, parts[0]); err != nil {
+		t.Fatal(err)
+	}
+	feedFixture(t, br, c, chat)
+	if mx.paths[len(mx.paths)-1] != editPath {
+		t.Fatal("edit retry changed transaction")
+	}
 	if mx.rooms != 1 || mx.messages != 3 {
 		t.Fatalf("expected one in-place edit: %d", mx.messages)
 	}

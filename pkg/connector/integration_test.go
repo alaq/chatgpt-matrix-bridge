@@ -6,11 +6,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/alaq/chatgpt-matrix-bridge/internal/delivery"
 	"github.com/alaq/chatgpt-matrix-bridge/internal/source"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
@@ -31,6 +33,8 @@ type matrixFixture struct {
 	messages int
 	uploads  int
 	contents []*event.MessageEventContent
+	paths    []string
+	accepted map[string]id.EventID
 	names    map[id.RoomID]string
 	failNext bool
 }
@@ -104,14 +108,29 @@ func (i *intentFixture) SendState(_ context.Context, room id.RoomID, typ event.T
 	}
 	return &mautrix.RespSendEvent{EventID: "$state"}, nil
 }
-func (i *intentFixture) SendMessage(_ context.Context, _ id.RoomID, _ event.Type, content *event.Content, _ *bridgev2.MatrixSendExtra) (*mautrix.RespSendEvent, error) {
+func (i *intentFixture) SendMessage(ctx context.Context, room id.RoomID, _ event.Type, content *event.Content, _ *bridgev2.MatrixSendExtra) (*mautrix.RespSendEvent, error) {
 	i.mx.mu.Lock()
 	defer i.mx.mu.Unlock()
 	if i.mx.failNext {
 		i.mx.failNext = false
 		return nil, fmt.Errorf("injected pre-send failure")
 	}
+	capture := &presentationTransport{}
+	req, _ := http.NewRequestWithContext(ctx, "PUT", "https://test.invalid/_hungryserv/owner/_matrix/client/v3/rooms/"+string(room)+"/send/m.room.encrypted/random", nil)
+	resp, err := (delivery.Transport{Base: capture}).RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body.Close()
+	i.mx.paths = append(i.mx.paths, capture.path)
+	if i.mx.accepted == nil {
+		i.mx.accepted = map[string]id.EventID{}
+	}
+	if existing, ok := i.mx.accepted[capture.path]; ok {
+		return &mautrix.RespSendEvent{EventID: existing}, nil
+	}
 	i.mx.messages++
+	i.mx.accepted[capture.path] = id.EventID(fmt.Sprintf("$message%d", i.mx.messages))
 	if parsed, ok := content.Parsed.(*event.MessageEventContent); ok {
 		copyContent := *parsed
 		i.mx.contents = append(i.mx.contents, &copyContent)

@@ -18,7 +18,6 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
-	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/format/mdext"
@@ -85,14 +84,14 @@ func renderMessage(m source.Message, body, conversationURL string) *event.Messag
 
 func presentationHash(content *event.MessageEventContent) string {
 	encoded, _ := json.Marshal(content)
-	return source.StableID("matrix-presentation-v1", string(encoded))
+	return source.StableID("matrix-presentation-v2", string(encoded))
 }
 
 // Update only our assistant's presentation. Preserve the original source hash
 // and Matrix event ID; a real source edit still fails closed. Operator messages
 // include original Matrix sends and must never be rewritten by this migration.
-func presentationUpsert(meta simplevent.EventMeta, messageID networkid.MessageID, role, rawBody, hash string, content *event.MessageEventContent) func(context.Context, *bridgev2.Portal, bridgev2.MatrixAPI, []*database.Message) (bridgev2.UpsertResult, error) {
-	return func(_ context.Context, _ *bridgev2.Portal, _ bridgev2.MatrixAPI, existing []*database.Message) (bridgev2.UpsertResult, error) {
+func presentationUpsert(messageID networkid.MessageID, role, rawBody, hash string, content *event.MessageEventContent) func(context.Context, *bridgev2.Portal, bridgev2.MatrixAPI, []*database.Message) (bridgev2.UpsertResult, error) {
+	return func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message) (bridgev2.UpsertResult, error) {
 		for _, part := range existing {
 			old, ok := part.Metadata.(*MessageMetadata)
 			if !ok || old.Hash != hash {
@@ -115,25 +114,22 @@ func presentationUpsert(meta simplevent.EventMeta, messageID networkid.MessageID
 			existing[0].Metadata = updated
 			return bridgev2.UpsertResult{SaveParts: true}, nil
 		}
-		edit := &simplevent.Message[*event.MessageEventContent]{
-			EventMeta:     meta.WithType(bridgev2.RemoteEventEdit).WithTimestamp(time.Now()),
-			TargetMessage: messageID,
-			Data:          content,
-			ConvertEditFunc: func(_ context.Context, _ *bridgev2.Portal, _ bridgev2.MatrixAPI, parts []*database.Message, rendered *event.MessageEventContent) (*bridgev2.ConvertedEdit, error) {
-				if len(parts) != 1 {
-					return nil, errors.New("presentation target changed")
-				}
-				// Copy metadata: a failed send must leave the old persisted rendering
-				// eligible for retry. bridgev2 saves this only after Matrix accepts it.
-				part := *parts[0]
-				part.Metadata = updated
-				copyContent := *rendered
-				return &bridgev2.ConvertedEdit{ModifiedParts: []*bridgev2.ConvertedEditPart{{Part: &part, Type: event.EventMessage, Content: &copyContent}}}, nil
-			},
+		if intent.GetMXID() != existing[0].SenderMXID || existing[0].Room != portal.PortalKey || existing[0].HasFakeMXID() {
+			return bridgev2.UpsertResult{}, errors.New("presentation target sender or room mismatch")
 		}
-		edit.MutateContextFunc = func(ctx context.Context) context.Context {
-			return delivery.WithMessage(ctx, source.StableID("presentation", string(messageID), renderHash))
+		copyContent := *content
+		copyContent.SetEdit(existing[0].MXID)
+		// Nested bridgev2 subevents do not apply their context mutator. Send the
+		// replacement here, inside the serialized portal handler, with an explicit
+		// transaction key distinct from the original. Encryption stays in MatrixAPI.
+		editCtx := delivery.WithMessage(ctx, source.StableID("presentation", string(messageID), renderHash))
+		_, err := intent.SendMessage(editCtx, portal.MXID, event.EventMessage, &event.Content{Parsed: &copyContent}, &bridgev2.MatrixSendExtra{Timestamp: time.Now(), MessageMeta: existing[0]})
+		if err != nil {
+			return bridgev2.UpsertResult{}, err
 		}
-		return bridgev2.UpsertResult{SubEvents: []bridgev2.RemoteEvent{edit}}, nil
+		// Only advance after acceptance. If the DB commit fails, the same edit
+		// transaction is reused on the next poll, retaining the original event ID.
+		existing[0].Metadata = updated
+		return bridgev2.UpsertResult{SaveParts: true}, nil
 	}
 }

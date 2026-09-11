@@ -58,7 +58,7 @@ func (c *Client) events(chat source.Conversation) []bridgev2.RemoteEvent {
 			EventMeta:          messageMeta,
 			ID:                 messageID,
 			Data:               &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{Type: event.EventMessage, Content: content, DBMetadata: metadata}}},
-			HandleExistingFunc: presentationUpsert(messageMeta, messageID, m.Role, body, hash, content),
+			HandleExistingFunc: presentationUpsert(messageID, m.Role, body, hash, content),
 		}})
 	}
 	return result
