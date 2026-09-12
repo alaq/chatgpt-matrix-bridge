@@ -30,6 +30,9 @@ remain planned source adapters.
   and presentation updates while refresh is unavailable; status stays disconnected.
   A transient refresh failure does not invalidate the configured login or discard
   follow-ups. Actual sending still verifies the fresh source account before submission.
+- Recovered sends retain the original Matrix event and client transaction IDs in
+  their completion receipts, so clients can match them to the original outgoing
+  message. Legacy outboxes resolve the client transaction from the verified event.
 - Visible user and assistant text is mirrored. Attachment counts link the reader
   back to the original conversation. Hidden reasoning, raw nodes, and attachment
   credentials are not exported.

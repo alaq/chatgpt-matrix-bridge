@@ -21,7 +21,7 @@ func outgoingFixture(t *testing.T, br *bridgev2.Bridge, c *Client) *bridgev2.Mat
 	}
 	c.connector.Config.SendEnabled = true
 	return &bridgev2.MatrixMessage{MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{
-		Portal: portal, Event: &event.Event{ID: "$original-matrix", Sender: c.login.UserMXID, Timestamp: time.Now().UnixMilli()},
+		Portal: portal, Event: &event.Event{ID: "$original-matrix", Sender: c.login.UserMXID, Timestamp: time.Now().UnixMilli(), Unsigned: event.Unsigned{TransactionID: "~beeper-original-client-transaction"}},
 		Content: &event.MessageEventContent{MsgType: event.MsgText, Body: "Continue from Matrix"},
 	}}
 }
@@ -38,6 +38,9 @@ func TestOutboundRestartRecoversOriginalEventAndSuppressesEcho(t *testing.T) {
 		out, err := c.getOutbound(ctx, msg.Portal)
 		if err != nil || out == nil || out.Request.TransactionID != r.TransactionID {
 			t.Fatal("submission preceded durable outbox")
+		}
+		if out.MatrixTransactionID != msg.Event.Unsigned.TransactionID {
+			t.Fatal("client transaction missing from durable outbox")
 		}
 		submitted = r
 		return &source.SendResult{Version: 1, Status: "accepted", UserMessageID: "33333333-3333-3333-3333-333333333333"}, nil
@@ -64,13 +67,68 @@ func TestOutboundRestartRecoversOriginalEventAndSuppressesEcho(t *testing.T) {
 	if recovered != 1 || mx.messages != 3 || mx.rooms != 1 {
 		t.Fatalf("recovery=%d messages=%d rooms=%d", recovered, mx.messages, mx.rooms)
 	}
+	if len(mx.statusEvents) != 1 || mx.statusEvents[0].TargetTxnID != msg.Event.Unsigned.TransactionID || mx.statusEvents[0].RelatesTo.EventID != msg.Event.ID || mx.statusEvents[0].Status != event.MessageStatusSuccess {
+		t.Fatal("recovery receipt did not settle the original event and client transaction")
+	}
 	stored, err := br.DB.Message.GetPartByMXID(ctx, msg.Event.ID)
 	if err != nil || stored == nil || stored.ID != response.DB.ID {
 		t.Fatalf("association missing: %v", err)
 	}
 	feedFixture(t, br, c, chat)
-	if recovered != 1 || mx.messages != 3 {
+	if recovered != 1 || mx.messages != 3 || len(mx.statusEvents) != 1 {
 		t.Fatal("replay duplicated or recovered twice")
+	}
+}
+
+func TestLegacyRecoveryReceiptVerifiesEventBeforeClearingOutbox(t *testing.T) {
+	ctx := context.Background()
+	mx := &matrixFixture{names: map[id.RoomID]string{}, getEvents: map[id.EventID]*event.Event{}}
+	br, c := startFixture(t, filepath.Join(t.TempDir(), "bridge.db"), mx)
+	defer br.Stop()
+	feedFixture(t, br, c, testChat())
+	msg := outgoingFixture(t, br, c)
+	c.sendFunc = func(context.Context, source.SendRequest) (*source.SendResult, error) {
+		return &source.SendResult{Version: 1, Status: "accepted", UserMessageID: "33333333-3333-3333-3333-333333333333"}, nil
+	}
+	response, err := c.HandleMatrixMessage(ctx, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = br.DB.Message.Insert(ctx, response.DB); err != nil {
+		t.Fatal(err)
+	}
+	out, err := c.getOutbound(ctx, msg.Portal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.MatrixTransactionID = "" // Database written by the previous release.
+	if err = c.setOutbound(ctx, msg.Portal, out); err != nil {
+		t.Fatal(err)
+	}
+	c.sendFunc = func(context.Context, source.SendRequest) (*source.SendResult, error) {
+		t.Fatal("resent an accepted message")
+		return nil, nil
+	}
+	for _, original := range []*event.Event{nil, {ID: msg.Event.ID, Sender: "@wrong:test.invalid"}, {ID: msg.Event.ID, Sender: msg.Event.Sender, RoomID: "!wrong:test.invalid"}} {
+		mx.getEvents[msg.Event.ID] = original
+		if err = c.recoverOutbound(ctx, msg.Portal); err == nil {
+			t.Fatal("unverified receipt target accepted")
+		}
+		pending, _ := c.getOutbound(ctx, msg.Portal)
+		if pending == nil || len(mx.statusEvents) != 0 {
+			t.Fatal("lost pending receipt or emitted unverified success")
+		}
+	}
+	mx.getEvents[msg.Event.ID] = msg.Event
+	if err = c.recoverOutbound(ctx, msg.Portal); err != nil {
+		t.Fatal(err)
+	}
+	if len(mx.statusEvents) != 1 || mx.statusEvents[0].TargetTxnID != msg.Event.Unsigned.TransactionID {
+		t.Fatal("legacy receipt lost client transaction")
+	}
+	pending, err := c.getOutbound(ctx, msg.Portal)
+	if err != nil || pending != nil {
+		t.Fatal("resolved recovery still pending")
 	}
 }
 func TestUncertainOutboundPausesRoomAndRejectsWrongSender(t *testing.T) {

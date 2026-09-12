@@ -20,10 +20,11 @@ import (
 // the original Matrix event before submitting, then recover its source association
 // before any incoming mirror can create an echo. This private DB contains text.
 type outbound struct {
-	Request     source.SendRequest `json:"request"`
-	MatrixEvent id.EventID         `json:"matrix_event"`
-	Sender      id.UserID          `json:"sender"`
-	Timestamp   int64              `json:"timestamp"`
+	Request             source.SendRequest `json:"request"`
+	MatrixEvent         id.EventID         `json:"matrix_event"`
+	MatrixTransactionID string             `json:"matrix_transaction_id,omitempty"`
+	Sender              id.UserID          `json:"sender"`
+	Timestamp           int64              `json:"timestamp"`
 }
 
 func (c *Client) outboxKey(portal *bridgev2.Portal) string {
@@ -98,8 +99,18 @@ func (c *Client) recoverOutbound(ctx context.Context, portal *bridgev2.Portal) e
 }
 
 func (c *Client) finishRecovery(ctx context.Context, portal *bridgev2.Portal, out *outbound) error {
+	transactionID := out.MatrixTransactionID
+	if transactionID == "" {
+		// Older outboxes did not retain the client's transaction. Resolve it from
+		// the exact original event so mobile clients can settle their local echo.
+		original, err := c.connector.br.Bot.GetEvent(ctx, portal.MXID, out.MatrixEvent)
+		if err != nil || original == nil || original.ID != out.MatrixEvent || original.Sender != out.Sender || (original.RoomID != "" && original.RoomID != portal.MXID) {
+			return errors.New("cannot verify original event for recovery receipt")
+		}
+		transactionID = original.Unsigned.TransactionID
+	}
 	c.connector.br.Matrix.SendMessageStatus(ctx, &bridgev2.MessageStatus{Status: event.MessageStatusSuccess}, &bridgev2.MessageStatusEventInfo{
-		RoomID: portal.MXID, SourceEventID: out.MatrixEvent, Sender: out.Sender, EventType: event.EventMessage, MessageType: event.MsgText,
+		RoomID: portal.MXID, SourceEventID: out.MatrixEvent, TransactionID: transactionID, Sender: out.Sender, EventType: event.EventMessage, MessageType: event.MsgText,
 	})
 	return c.setOutbound(ctx, portal, nil)
 }
@@ -130,7 +141,7 @@ func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMe
 	if err := c.recoverOutbound(ctx, msg.Portal); err != nil {
 		return nil, sendError("A previous send needs reconciliation before this room can continue.", false)
 	}
-	out := &outbound{Request: req, MatrixEvent: msg.Event.ID, Sender: msg.Event.Sender, Timestamp: msg.Event.Timestamp}
+	out := &outbound{Request: req, MatrixEvent: msg.Event.ID, MatrixTransactionID: msg.Event.Unsigned.TransactionID, Sender: msg.Event.Sender, Timestamp: msg.Event.Timestamp}
 	if err := c.setOutbound(ctx, msg.Portal, out); err != nil {
 		return nil, sendError("Could not record this send safely.", true)
 	}

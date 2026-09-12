@@ -28,16 +28,18 @@ import (
 
 type matrixFixture struct {
 	bridgev2.MatrixConnector
-	mu       sync.Mutex
-	rooms    int
-	messages int
-	uploads  int
-	contents []*event.MessageEventContent
-	paths    []string
-	accepted map[string]id.EventID
-	names    map[id.RoomID]string
-	failNext bool
-	failAt   int
+	mu           sync.Mutex
+	rooms        int
+	messages     int
+	uploads      int
+	contents     []*event.MessageEventContent
+	paths        []string
+	accepted     map[string]id.EventID
+	names        map[id.RoomID]string
+	failNext     bool
+	failAt       int
+	statusEvents []*event.BeeperMessageStatusEventContent
+	getEvents    map[id.EventID]*event.Event
 }
 type intentFixture struct {
 	bridgev2.MatrixAPI
@@ -67,7 +69,10 @@ func (m *matrixFixture) NewUserIntent(context.Context, id.UserID, string) (bridg
 	return nil, "", nil
 }
 func (m *matrixFixture) SendBridgeStatus(context.Context, *status.BridgeState) error { return nil }
-func (m *matrixFixture) SendMessageStatus(context.Context, *bridgev2.MessageStatus, *bridgev2.MessageStatusEventInfo) {
+func (m *matrixFixture) SendMessageStatus(_ context.Context, status *bridgev2.MessageStatus, info *bridgev2.MessageStatusEventInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.statusEvents = append(m.statusEvents, status.ToMSSEvent(info))
 }
 func (m *matrixFixture) GetPowerLevels(context.Context, id.RoomID) (*event.PowerLevelsEventContent, error) {
 	return &event.PowerLevelsEventContent{}, nil
@@ -80,11 +85,17 @@ func (m *matrixFixture) GetMemberInfo(context.Context, id.RoomID, id.UserID) (*e
 }
 func (m *matrixFixture) GenerateDeterministicRoomID(networkid.PortalKey) id.RoomID { return "" }
 func (i *intentFixture) GetMXID() id.UserID                                        { return i.user }
-func (i *intentFixture) IsDoublePuppet() bool                                      { return false }
-func (i *intentFixture) SetDisplayName(context.Context, string) error              { return nil }
-func (i *intentFixture) SetAvatarURL(context.Context, id.ContentURIString) error   { return nil }
-func (i *intentFixture) SetExtraProfileMeta(context.Context, any) error            { return nil }
-func (i *intentFixture) SetProfile(context.Context, any) error                     { return nil }
+func (i *intentFixture) GetEvent(_ context.Context, _ id.RoomID, eventID id.EventID) (*event.Event, error) {
+	if evt := i.mx.getEvents[eventID]; evt != nil {
+		return evt, nil
+	}
+	return nil, fmt.Errorf("event unavailable")
+}
+func (i *intentFixture) IsDoublePuppet() bool                                    { return false }
+func (i *intentFixture) SetDisplayName(context.Context, string) error            { return nil }
+func (i *intentFixture) SetAvatarURL(context.Context, id.ContentURIString) error { return nil }
+func (i *intentFixture) SetExtraProfileMeta(context.Context, any) error          { return nil }
+func (i *intentFixture) SetProfile(context.Context, any) error                   { return nil }
 func (i *intentFixture) EnsureJoined(context.Context, id.RoomID, ...bridgev2.EnsureJoinedParams) error {
 	return nil
 }
