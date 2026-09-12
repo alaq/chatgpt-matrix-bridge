@@ -43,6 +43,7 @@ func renderMessage(m source.Message, body, conversationURL string) *event.Messag
 		content := format.TextToContent(body)
 		return &content
 	}
+	body = renderWritingBlocks(body)
 	replacements := map[string]string{}
 	for _, group := range m.CitationGroups {
 		if citationMarker.FindString(group.Marker) != group.Marker || group.Marker == "" {

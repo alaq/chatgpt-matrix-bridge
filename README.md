@@ -36,7 +36,9 @@ remain planned source adapters.
 - The ChatGPT participant, rooms, bridge bot and network metadata use a bundled
   icon, uploaded once per homeserver/database and reused across restarts.
 - Assistant Markdown is sent as Matrix HTML: bold, lists, links, tables and fenced
-  code blocks. Source HTML is escaped, unsafe Markdown URLs are disabled and no
+  code blocks. ChatGPT `:::writing` containers become labelled quoted drafts;
+  internal IDs/attributes are hidden and literal code examples are preserved.
+  Source HTML is escaped, unsafe Markdown URLs are disabled and no
   mention notifications are generated. User messages retain their original text.
 - Web citation markers become source links when the feed includes `citation_groups`.
   Unresolved citations link to the original ChatGPT conversation. Existing assistant
