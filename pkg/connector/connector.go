@@ -61,6 +61,7 @@ type LoginMetadata struct {
 type MessageMetadata struct {
 	Hash             string `json:"hash"`
 	PresentationHash string `json:"presentation_hash,omitempty"`
+	PartCount        int    `json:"part_count,omitempty"`
 }
 
 func (c *Connector) LoadUserLogin(_ context.Context, login *bridgev2.UserLogin) error {
@@ -221,7 +222,13 @@ func (c *Client) dispatch(ctx context.Context, chat source.Conversation) error {
 		case *simplevent.PreConvertedMessage:
 			e.MutateContextFunc = func(context.Context) context.Context { return delivery.WithMessage(ctx, string(e.ID)) }
 		case *sourceMessage:
-			e.MutateContextFunc = func(context.Context) context.Context { return delivery.WithMessage(ctx, string(e.ID)) }
+			e.MutateContextFunc = func(context.Context) context.Context {
+				key := string(e.ID)
+				if part := e.Data.Parts[0].ID; part != "" {
+					key = source.StableID("message-part-v1", key, string(part))
+				}
+				return delivery.WithMessage(ctx, key)
+			}
 		}
 		result := c.login.QueueRemoteEvent(evt)
 		if !result.Success {

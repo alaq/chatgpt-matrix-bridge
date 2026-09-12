@@ -7,6 +7,7 @@ require (
 	github.com/rs/zerolog v1.35.1
 	github.com/yuin/goldmark v1.8.5
 	go.mau.fi/util v0.10.0
+	golang.org/x/net v0.58.0
 	maunium.net/go/mautrix v0.30.0
 )
 
@@ -27,7 +28,6 @@ require (
 	go.mau.fi/zeroconfig v0.2.0 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297 // indirect
-	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect

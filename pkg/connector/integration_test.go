@@ -37,6 +37,7 @@ type matrixFixture struct {
 	accepted map[string]id.EventID
 	names    map[id.RoomID]string
 	failNext bool
+	failAt   int
 }
 type intentFixture struct {
 	bridgev2.MatrixAPI
@@ -113,8 +114,9 @@ func (i *intentFixture) SendState(_ context.Context, room id.RoomID, typ event.T
 func (i *intentFixture) SendMessage(ctx context.Context, room id.RoomID, _ event.Type, content *event.Content, _ *bridgev2.MatrixSendExtra) (*mautrix.RespSendEvent, error) {
 	i.mx.mu.Lock()
 	defer i.mx.mu.Unlock()
-	if i.mx.failNext {
+	if i.mx.failNext || (i.mx.failAt > 0 && i.mx.messages == i.mx.failAt) {
 		i.mx.failNext = false
+		i.mx.failAt = 0
 		return nil, fmt.Errorf("injected pre-send failure")
 	}
 	capture := &presentationTransport{}

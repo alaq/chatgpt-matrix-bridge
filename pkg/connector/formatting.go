@@ -88,6 +88,39 @@ func presentationHash(content *event.MessageEventContent) string {
 	return source.StableID("matrix-presentation-v2", string(encoded))
 }
 
+// Each upsert carries one part, keeping framework sends serialized and giving
+// each part its own delivery transaction. A partial import resumes only gaps.
+func messagePartUpsert(messageID networkid.MessageID, partID networkid.PartID, partCount int, role, rawBody, hash string, content *event.MessageEventContent) func(context.Context, *bridgev2.Portal, bridgev2.MatrixAPI, []*database.Message) (bridgev2.UpsertResult, error) {
+	return func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message) (bridgev2.UpsertResult, error) {
+		var target *database.Message
+		for _, part := range existing {
+			old, ok := part.Metadata.(*MessageMetadata)
+			if !ok || old.Hash != hash {
+				return bridgev2.UpsertResult{}, errors.New("source message edited; edit reconciliation is not implemented in this pilot")
+			}
+			if old.PartCount > 1 && old.PartCount != partCount {
+				return bridgev2.UpsertResult{}, errors.New("message part layout changed; reconciliation is required")
+			}
+			// A recovered outgoing user message already contains the whole text.
+			if role == "user" && part.PartID == "" && old.PartCount == 0 {
+				return bridgev2.UpsertResult{}, nil
+			}
+			if part.PartID == partID {
+				target = part
+			}
+		}
+		if target == nil {
+			return bridgev2.UpsertResult{ContinueMessageHandling: true}, nil
+		}
+		res, err := presentationUpsert(messageID, role, rawBody, hash, content)(ctx, portal, intent, []*database.Message{target})
+		if err == nil && partCount > 1 && target.Metadata.(*MessageMetadata).PartCount != partCount {
+			target.Metadata.(*MessageMetadata).PartCount = partCount
+			res.SaveParts = true
+		}
+		return res, err
+	}
+}
+
 // Update only our assistant's presentation. Preserve the original source hash
 // and Matrix event ID; a real source edit still fails closed. Operator messages
 // include original Matrix sends and must never be rewritten by this migration.
@@ -110,7 +143,7 @@ func presentationUpsert(messageID networkid.MessageID, role, rawBody, hash strin
 		if old.PresentationHash == renderHash {
 			return bridgev2.UpsertResult{}, nil
 		}
-		updated := &MessageMetadata{Hash: hash, PresentationHash: renderHash}
+		updated := &MessageMetadata{Hash: hash, PresentationHash: renderHash, PartCount: old.PartCount}
 		if old.PresentationHash == "" && content.Body == rawBody && content.Format == "" {
 			existing[0].Metadata = updated
 			return bridgev2.UpsertResult{SaveParts: true}, nil
@@ -118,13 +151,16 @@ func presentationUpsert(messageID networkid.MessageID, role, rawBody, hash strin
 		if intent.GetMXID() != existing[0].SenderMXID || existing[0].Room != portal.PortalKey || existing[0].HasFakeMXID() {
 			return bridgev2.UpsertResult{}, errors.New("presentation target sender or room mismatch")
 		}
-		copyContent := *content
-		copyContent.SetEdit(existing[0].MXID)
+		copyContent := presentationEdit(content, existing[0].MXID)
 		// Nested bridgev2 subevents do not apply their context mutator. Send the
 		// replacement here, inside the serialized portal handler, with an explicit
 		// transaction key distinct from the original. Encryption stays in MatrixAPI.
-		editCtx := delivery.WithMessage(ctx, source.StableID("presentation", string(messageID), renderHash))
-		_, err := intent.SendMessage(editCtx, portal.MXID, event.EventMessage, &event.Content{Parsed: &copyContent}, &bridgev2.MatrixSendExtra{Timestamp: time.Now(), MessageMeta: existing[0]})
+		editKey := source.StableID("presentation", string(messageID), renderHash)
+		if existing[0].PartID != "" {
+			editKey = source.StableID("presentation-part-v1", string(messageID), string(existing[0].PartID), renderHash)
+		}
+		editCtx := delivery.WithMessage(ctx, editKey)
+		_, err := intent.SendMessage(editCtx, portal.MXID, event.EventMessage, &event.Content{Parsed: copyContent}, &bridgev2.MatrixSendExtra{Timestamp: time.Now(), MessageMeta: existing[0]})
 		if err != nil {
 			return bridgev2.UpsertResult{}, err
 		}

@@ -33,6 +33,10 @@ remain planned source adapters.
 - Visible user and assistant text is mirrored. Attachment counts link the reader
   back to the original conversation. Hidden reasoning, raw nodes, and attachment
   credentials are not exported.
+- Oversized messages are split into ordered parts below Matrix's encrypted event
+  limit. Rich text and code remain readable; a failed part resumes without
+  duplicating accepted parts or blocking the rest of the conversation forever.
+  Ordinary messages keep their existing presentation and event identities.
 - The ChatGPT participant, rooms, bridge bot and network metadata use a bundled
   icon, uploaded once per homeserver/database and reused across restarts.
 - Assistant Markdown is sent as Matrix HTML: bold, lists, links, tables and fenced
@@ -43,7 +47,8 @@ remain planned source adapters.
 - Web citation markers become source links when the feed includes `citation_groups`.
   Unresolved citations link to the original ChatGPT conversation. Existing assistant
   messages receive an idempotent presentation edit; their event IDs and source hashes
-  stay unchanged. Ordinary source text edits remain unsupported.
+  stay unchanged. Ordinary source text edits and changes to an existing multipart
+  layout remain unsupported and pause that conversation for reconciliation.
 
 ## Build and test
 

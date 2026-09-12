@@ -48,18 +48,28 @@ func (c *Client) events(chat source.Conversation) []bridgev2.RemoteEvent {
 		}
 		hash := source.StableID(m.Role, body)
 		content := renderMessage(m, body, chat.URL)
-		metadata := &MessageMetadata{Hash: hash}
-		if m.Role == "assistant" {
-			metadata.PresentationHash = presentationHash(content)
-		}
 		messageID := networkid.MessageID(source.MessageID(account, chat.ID, m.ID))
 		messageMeta := meta.WithType(bridgev2.RemoteEventMessageUpsert).WithSender(sender).WithTimestamp(time.UnixMilli(int64(ts * 1000)))
-		result = append(result, &sourceMessage{client: c, PreConvertedMessage: &simplevent.PreConvertedMessage{
-			EventMeta:          messageMeta,
-			ID:                 messageID,
-			Data:               &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{Type: event.EventMessage, Content: content, DBMetadata: metadata}}},
-			HandleExistingFunc: presentationUpsert(messageID, m.Role, body, hash, content),
-		}})
+		contents := splitMessage(content)
+		for i, part := range contents {
+			partID := networkid.PartID("")
+			metadata := &MessageMetadata{Hash: hash}
+			if len(contents) > 1 {
+				metadata.PartCount = len(contents)
+			}
+			if i > 0 {
+				partID = networkid.PartID(fmt.Sprintf("text-%06d", i))
+			}
+			if m.Role == "assistant" {
+				metadata.PresentationHash = presentationHash(part)
+			}
+			result = append(result, &sourceMessage{client: c, PreConvertedMessage: &simplevent.PreConvertedMessage{
+				EventMeta:          messageMeta,
+				ID:                 messageID,
+				Data:               &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{ID: partID, Type: event.EventMessage, Content: part, DBMetadata: metadata}}},
+				HandleExistingFunc: messagePartUpsert(messageID, partID, len(contents), m.Role, body, hash, part),
+			}})
+		}
 	}
 	return result
 }
