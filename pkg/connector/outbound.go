@@ -210,6 +210,8 @@ func rejectedSendMessage(code string) string {
 		return "This local task is mirrored read-only. Open it in the desktop app to continue it."
 	case "codex_owner_unavailable":
 		return "The desktop app could not route this reply to the original task. Nothing was submitted. Open the task in the app, then retry the original message."
+	case "codex_turn_ended":
+		return "The Codex turn finished before this reply could join it. Nothing was submitted; retry the original message to continue the same task."
 	case "saved_send_draft_mismatch":
 		return "The ChatGPT editor did not preserve this message exactly. Nothing was submitted; retry the original message after the sender is fixed."
 	case "saved_send_existing_draft":

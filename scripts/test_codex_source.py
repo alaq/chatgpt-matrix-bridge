@@ -7,7 +7,7 @@ from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from unittest.mock import patch
-from codex_source import read_thread, send, probe, DesktopIPC
+from codex_source import read_thread, send, probe, DesktopIPC, DesktopRequestError
 
 class CodexTests(unittest.TestCase):
     def test_only_completed_visible_items_and_stable_identity(self):
@@ -53,6 +53,7 @@ class SendTests(unittest.TestCase):
         self.lose_reply = False
         self.no_owner = False
         self.append_receipt = True
+        self.inactive_rejection = False
         outer = self
         class Owner:
             def __init__(self, root):
@@ -65,6 +66,8 @@ class SendTests(unittest.TestCase):
                     return {'handledByClientId': 'original-owner'}
                 outer.assertEqual(target, 'original-owner')
                 outer.calls.append((method, params, version))
+                if outer.inactive_rejection:
+                    raise DesktopRequestError('Cannot steer conversation ' + outer.cid + ' because its active turn already ended')
                 if method == 'thread-follower-start-turn':
                     request = params['turnStart']['request']
                 else:
@@ -125,6 +128,20 @@ class SendTests(unittest.TestCase):
         self.record({'type':'task_complete','turn_id':'active-turn'})
         self.assertEqual(send(self.root,self.journal,self.req)['status'],'uncertain')
         self.assertEqual([c[0] for c in self.calls],['thread-follower-steer-turn'])
+
+    def test_explicit_active_turn_rejection_allows_original_message_retry(self):
+        self.record({'type':'task_started','turn_id':'active-turn'})
+        self.inactive_rejection = True
+        self.assertEqual(send(self.root,self.journal,self.req),
+                         {'version':1,'status':'not_sent','error':'codex_turn_ended'})
+        self.assertEqual(len(self.calls),1)
+        self.record({'type':'task_complete','turn_id':'active-turn'})
+        self.inactive_rejection = False
+        self.assertEqual(send(self.root,self.journal,self.req)['status'],'accepted')
+        self.assertEqual([c[0] for c in self.calls],
+                         ['thread-follower-steer-turn','thread-follower-start-turn'])
+        self.assertEqual(self.calls[0][1]['clientUserMessageId'],
+                         self.calls[1][1]['turnStart']['request']['clientUserMessageId'])
 
     def test_identical_text_with_wrong_client_id_does_not_resolve(self):
         self.lose_reply = True

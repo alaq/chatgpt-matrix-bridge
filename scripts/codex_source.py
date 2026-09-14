@@ -89,6 +89,12 @@ def read_thread(root, row, running_timeout=300):
     return messages, active and (running_timeout is None or time.time()-last_seen < running_timeout)
 
 
+class DesktopRequestError(ValueError):
+    def __init__(self, error):
+        self.error = error
+        super().__init__('desktop request unavailable: ' + str(error))
+
+
 class DesktopIPC:
     def __init__(self, root):
         path = root / 'ipc/ipc.sock'
@@ -137,7 +143,7 @@ class DesktopIPC:
                 self.write({'type': 'client-discovery-response', 'requestId': response['requestId'], 'response': {'canHandle': False}})
             if response.get('type') == 'response' and response.get('requestId') == request_id:
                 if response.get('resultType') != 'success':
-                    raise ValueError('desktop request unavailable: ' + str(response.get('error')))
+                    raise DesktopRequestError(response.get('error'))
                 if response.get('method') != method or not response.get('handledByClientId'):
                     raise ValueError('desktop response method/owner mismatch')
                 if target and response['handledByClientId'] != target:
@@ -205,7 +211,7 @@ def send_locked(root, journal, request):
     if row is None:
         raise ValueError('local task is unavailable')
     messages, active = read_thread(root, row)
-    if record:
+    if record and record.get('status') != 'not_sent':
         if record.get('status') == 'accepted':
             return {'version': 1, 'status': 'accepted', 'userMessageId': record['message_id']}
         matches = [m for m in messages if m.get('client_id') == record['client_id'] and m['role'] == 'user' and digest(m['text']) == identity['text_hash']]
@@ -230,7 +236,18 @@ def send_locked(root, journal, request):
         method, params, version = turn_request(cid[6:], request['text'], client_id, row['cwd'], active)
         record = {**identity, 'client_id': client_id, 'status': 'submitting', 'method': method}
         atomic_record(file, record)
-        ipc.call(method, params, version=version, target=owner)
+        try:
+            ipc.call(method, params, version=version, target=owner)
+        except DesktopRequestError as error:
+            # Only explicit pre-submission rejections permit another attempt.
+            # Timeouts, disconnects and arbitrary handler errors stay uncertain.
+            inactive = 'Cannot steer conversation ' + cid[6:] + ' because its active turn already ended'
+            if error.error not in ('no-client-found', 'request-version-mismatch', 'no-handler-for-request', inactive):
+                raise
+            code = 'codex_turn_ended' if error.error == inactive else 'codex_owner_unavailable'
+            record.update(status='not_sent')
+            atomic_record(file, record)
+            return {'version': 1, 'status': 'not_sent', 'error': code}
     finally:
         ipc.close()
     for _ in range(20):
