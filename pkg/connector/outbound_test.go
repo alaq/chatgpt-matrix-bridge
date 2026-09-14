@@ -162,6 +162,36 @@ func TestUncertainOutboundPausesRoomAndRejectsWrongSender(t *testing.T) {
 	}
 }
 
+func TestUnavailableTaskOwnerProducesVisibleOriginalMessageFailure(t *testing.T) {
+	ctx := context.Background()
+	mx := &matrixFixture{names: map[id.RoomID]string{}}
+	br, c := startFixture(t, filepath.Join(t.TempDir(), "bridge.db"), mx)
+	defer br.Stop()
+	feedFixture(t, br, c, testChat())
+	msg := outgoingFixture(t, br, c)
+	c.sendFunc = func(context.Context, source.SendRequest) (*source.SendResult, error) {
+		return &source.SendResult{Version: 1, Status: "not_sent", Error: "codex_owner_unavailable"}, nil
+	}
+	response, err := c.HandleMatrixMessage(ctx, msg)
+	var failure bridgev2.MessageStatus
+	if response != nil || !errors.As(err, &failure) || !failure.SendNotice || !failure.IsCertain {
+		t.Fatalf("missing visible pre-submission failure: %#v, %v", response, err)
+	}
+	info := bridgev2.StatusEventInfoFromEvent(msg.Event)
+	info.MessageType = event.MsgText
+	notice := failure.ToNoticeEvent(info)
+	if notice.MsgType != event.MsgNotice || notice.RelatesTo.GetReplyTo() != msg.Event.ID {
+		t.Fatalf("notice lost the original reply target: %#v", notice)
+	}
+	want := "⚠️ Your message was not bridged: " + rejectedSendMessage("codex_owner_unavailable")
+	if notice.Body != want {
+		t.Fatalf("notice does not explain safe retry: %q", notice.Body)
+	}
+	if pending, err := c.getOutbound(ctx, msg.Portal); err != nil || pending != nil {
+		t.Fatalf("explicitly rejected message should remain available for user retry: %v", err)
+	}
+}
+
 func TestAutomaticBootstrapPreservesAlreadyLoadedLogin(t *testing.T) {
 	mx := &matrixFixture{names: map[id.RoomID]string{}}
 	br, c := startFixture(t, filepath.Join(t.TempDir(), "bridge.db"), mx)

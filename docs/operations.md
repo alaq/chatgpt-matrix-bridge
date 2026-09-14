@@ -49,6 +49,12 @@ Source failure and Matrix delivery failure are separate fields. Check timestamps
 not merely whether a process exists. Failures back off; the last captured archive
 remains usable. Normal polling is configured with `poll_seconds`.
 
+Enable `matrix.message_error_notices` alongside `matrix.message_status_events`.
+The connector requests a visible notice replying to the failed original message;
+some clients can still show their transport-level "Sent" label when the source
+rejected the message. A successful Matrix upload is not source acceptance. These
+notices include whether submission is known not to have happened or is uncertain.
+
 Use `retry` to reconcile the original pending attempts. Never erase sender journals
 or create another message merely because acceptance is uncertain. Accepted user
 messages are acknowledged before the generating page closes; a timeout is not
@@ -82,6 +88,12 @@ It is a readiness check, not proof of a completed live send. A missing owner kee
 the room read-only until the installed app's connection is verified. The official
 app-server continuation methods require a connection to the original server;
 starting another server over the same task store does not establish that connection.
+
+An idle task may have no registered owner even while the app is running. Opening
+that original task in the desktop app can restore its owner; probe again before
+retrying the original message. This does not remove the desktop availability
+requirement. Recovery must preserve the original event, client transaction and
+exact text, rather than posting a replacement message.
 
 The sender starts an idle task through its existing owner and steers an unfinished
 turn through that same owner. It supplies no model, effort, permission or workspace

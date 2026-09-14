@@ -129,7 +129,7 @@ func (c *Client) finishRecovery(ctx context.Context, portal *bridgev2.Portal, ou
 	return c.setOutbound(ctx, portal, nil)
 }
 func sendError(message string, certain bool) error {
-	return bridgev2.WrapErrorInStatus(errors.New(message)).WithIsCertain(certain).WithErrorAsMessage()
+	return bridgev2.WrapErrorInStatus(errors.New(message)).WithIsCertain(certain).WithErrorAsMessage().WithSendNotice(true)
 }
 func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	if !c.connector.Config.SendEnabled {
