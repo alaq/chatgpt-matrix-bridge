@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -29,6 +30,7 @@ type Message struct {
 	Text            string          `json:"text"`
 	CreatedAt       *float64        `json:"created_at"`
 	AttachmentCount int             `json:"attachment_count"`
+	Attachments     []Attachment    `json:"attachments,omitempty"`
 	CitationGroups  []CitationGroup `json:"citation_groups,omitempty"`
 }
 
@@ -43,6 +45,8 @@ type CitationGroup struct {
 }
 
 type Conversation struct {
+	Kind      string    `json:"kind,omitempty"`
+	Running   bool      `json:"running,omitempty"`
 	ID        string    `json:"id"`
 	Revision  string    `json:"revision"`
 	Title     string    `json:"title"`
@@ -83,7 +87,11 @@ func (s *Snapshot) Validate() error {
 	}
 	seen := map[string]bool{}
 	for _, c := range s.Conversations {
-		if !idPattern.MatchString(c.ID) || seen[c.ID] || !accountPattern.MatchString(c.Revision) || c.URL != "https://chatgpt.com/c/"+c.ID || !finite(c.CreatedAt) || !finite(c.UpdatedAt) {
+		validID := idPattern.MatchString(c.ID) && c.URL == "https://chatgpt.com/c/"+c.ID && (c.Kind == "" || c.Kind == "chatgpt" || c.Kind == "work")
+		if c.Kind == "codex" {
+			validID = strings.HasPrefix(c.ID, "codex:") && idPattern.MatchString(strings.TrimPrefix(c.ID, "codex:")) && c.URL == "codex://threads/"+strings.TrimPrefix(c.ID, "codex:")
+		}
+		if !validID || seen[c.ID] || !accountPattern.MatchString(c.Revision) || !finite(c.CreatedAt) || !finite(c.UpdatedAt) {
 			return errors.New("invalid or duplicate conversation identity")
 		}
 		seen[c.ID] = true
@@ -198,7 +206,7 @@ func (b Backend) Read(ctx context.Context) (*Snapshot, error) {
 func (b Backend) Refresh(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	_, err := b.run(ctx, "sync", "--max-batches", "5")
+	_, err := b.run(ctx, "sync", "--max-batches", "5", "--bridge-progress")
 	// A partial window exits nonzero. The next poll resumes the collector checkpoint.
 	return err
 }

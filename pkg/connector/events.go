@@ -14,13 +14,23 @@ import (
 )
 
 func (c *Client) chatInfo(chat source.Conversation) *bridgev2.ChatInfo {
-	name := "ChatGPT · " + strings.Join(strings.Fields(chat.Title), " ")
+	label := "ChatGPT"
+	if chat.Kind == "codex" {
+		label = "Codex"
+	} else if chat.Kind == "work" {
+		label = "ChatGPT Work"
+	}
+	name := label + " · " + strings.Join(strings.Fields(chat.Title), " ")
 	if len([]rune(name)) > 200 {
 		name = string([]rune(name)[:200])
 	}
+	participant := label
+	if chat.Kind == "work" {
+		participant = "ChatGPT"
+	}
 	return &bridgev2.ChatInfo{Name: ptr.Ptr(name), Avatar: c.connector.avatar(), Topic: ptr.Ptr(chat.URL), Type: ptr.Ptr(database.RoomTypeDefault), JoinRule: &event.JoinRulesEventContent{JoinRule: event.JoinRuleInvite}, Members: &bridgev2.ChatMemberList{IsFull: true, Members: []bridgev2.ChatMember{
 		{EventSender: bridgev2.EventSender{IsFromMe: true, Sender: c.userID(), SenderLogin: c.login.ID}, Membership: event.MembershipJoin, PowerLevel: ptr.Ptr(50)},
-		{EventSender: bridgev2.EventSender{Sender: c.assistantID()}, UserInfo: &bridgev2.UserInfo{Name: ptr.Ptr("ChatGPT"), Avatar: c.connector.avatar()}, Membership: event.MembershipJoin, PowerLevel: ptr.Ptr(50)},
+		{EventSender: bridgev2.EventSender{Sender: c.sourceAssistantID(chat)}, UserInfo: &bridgev2.UserInfo{Name: ptr.Ptr(participant), Avatar: c.connector.avatar()}, Membership: event.MembershipJoin, PowerLevel: ptr.Ptr(50)},
 	}}, ExcludeChangesFromTimeline: true}
 }
 
@@ -31,7 +41,7 @@ func (c *Client) events(chat source.Conversation) []bridgev2.RemoteEvent {
 	// Resync creates rooms even for conversations without a visible assistant response.
 	result := []bridgev2.RemoteEvent{&simplevent.ChatResync{EventMeta: meta.WithType(bridgev2.RemoteEventChatResync), ChatInfo: c.chatInfo(chat)}}
 	for _, m := range chat.Messages {
-		sender := bridgev2.EventSender{Sender: c.assistantID()}
+		sender := bridgev2.EventSender{Sender: c.sourceAssistantID(chat)}
 		if m.Role == "user" {
 			sender = bridgev2.EventSender{Sender: c.userID(), SenderLogin: c.login.ID, IsFromMe: true}
 		}
@@ -63,12 +73,22 @@ func (c *Client) events(chat source.Conversation) []bridgev2.RemoteEvent {
 			if m.Role == "assistant" {
 				metadata.PresentationHash = presentationHash(part)
 			}
+			upsert := messagePartUpsert(messageID, partID, len(contents), m.Role, body, hash, part)
+			if c.connector.Config.SyncEdits {
+				upsert = reconciledPartUpsert(messageID, partID, len(contents), m.Role, body, hash, part)
+			}
 			result = append(result, &sourceMessage{client: c, PreConvertedMessage: &simplevent.PreConvertedMessage{
 				EventMeta:          messageMeta,
 				ID:                 messageID,
 				Data:               &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{ID: partID, Type: event.EventMessage, Content: part, DBMetadata: metadata}}},
-				HandleExistingFunc: messagePartUpsert(messageID, partID, len(contents), m.Role, body, hash, part),
+				HandleExistingFunc: upsert,
 			}})
+		}
+		mediaStart, _ := time.Parse(time.RFC3339, c.connector.Config.MediaSince)
+		if c.connector.Config.SyncMedia && (c.connector.Config.MediaSince == "" || ts >= float64(mediaStart.Unix())) {
+			for _, attachment := range m.Attachments {
+				result = append(result, c.attachmentEvent(messageMeta, chat, m, attachment))
+			}
 		}
 	}
 	return result

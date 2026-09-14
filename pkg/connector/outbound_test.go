@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -56,7 +57,7 @@ func TestOutboundRestartRecoversOriginalEventAndSuppressesEcho(t *testing.T) {
 	c.connector.Config.SendEnabled = true
 	recovered := 0
 	c.sendFunc = func(_ context.Context, r source.SendRequest) (*source.SendResult, error) {
-		if r != submitted {
+		if !reflect.DeepEqual(r, submitted) {
 			t.Fatal("recovery changed transaction or text")
 		}
 		recovered++

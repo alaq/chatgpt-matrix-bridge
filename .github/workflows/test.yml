@@ -12,4 +12,5 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go test -race -tags goolm ./...
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: go build -tags goolm ./cmd/chatgpt-matrix-bridge

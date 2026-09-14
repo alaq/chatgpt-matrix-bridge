@@ -12,7 +12,7 @@ var Tag, Commit, BuildTime string
 
 func main() {
 	syscall.Umask(0o077)
-	m := mxmain.BridgeMain{Name: "chatgpt-matrix-bridge", Description: "A Matrix bridge for saved ChatGPT conversations", URL: "https://github.com/alaq/chatgpt-matrix-bridge", Version: "0.1.0", Connector: &connector.Connector{}}
+	m := mxmain.BridgeMain{Name: "chatgpt-matrix-bridge", Description: "A Matrix bridge for saved ChatGPT conversations and local tasks", URL: "https://github.com/alaq/chatgpt-matrix-bridge", Version: "0.2.0", Connector: &connector.Connector{}}
 	m.InitVersion(Tag, Commit, BuildTime)
 	m.PostInit = func() {
 		delivery.Install(m.Bridge, m.Matrix)

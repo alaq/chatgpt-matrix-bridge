@@ -3,6 +3,9 @@ package source
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,26 +16,48 @@ import (
 )
 
 type SendRequest struct {
-	Version        int    `json:"version"`
-	AccountKey     string `json:"accountKey"`
-	ConversationID string `json:"conversationId"`
-	TransactionID  string `json:"transactionId"`
-	Text           string `json:"text"`
+	Version        int              `json:"version"`
+	AccountKey     string           `json:"accountKey"`
+	ConversationID string           `json:"conversationId"`
+	TransactionID  string           `json:"transactionId"`
+	Text           string           `json:"text"`
+	Attachments    []SendAttachment `json:"attachments,omitempty"`
+}
+type SendAttachment struct {
+	Name     string `json:"name"`
+	MimeType string `json:"mimeType"`
+	SHA256   string `json:"sha256"`
+	Data     string `json:"data"`
 }
 type SendResult struct {
-	Version       int    `json:"version"`
-	Status        string `json:"status"`
-	UserMessageID string `json:"userMessageId"`
-	Error         string `json:"error"`
+	Version       int      `json:"version"`
+	Status        string   `json:"status"`
+	UserMessageID string   `json:"userMessageId"`
+	Error         string   `json:"error"`
+	AttachmentIDs []string `json:"attachmentIDs,omitempty"`
 }
 
 func (r SendRequest) Validate() error {
-	if r.Version != 1 || !accountPattern.MatchString(r.AccountKey) || !accountPattern.MatchString(r.TransactionID) || !idPattern.MatchString(r.ConversationID) || strings.TrimSpace(r.Text) == "" || len(r.Text) > 12000 || strings.ContainsRune(r.Text, 0) {
+	validID := idPattern.MatchString(r.ConversationID) || strings.HasPrefix(r.ConversationID, "codex:") && idPattern.MatchString(strings.TrimPrefix(r.ConversationID, "codex:"))
+	if r.Version != 1 || !accountPattern.MatchString(r.AccountKey) || !accountPattern.MatchString(r.TransactionID) || !validID || strings.TrimSpace(r.Text) == "" && len(r.Attachments) == 0 || len(r.Text) > 12000 || strings.ContainsRune(r.Text, 0) || len(r.Attachments) > 1 {
 		return errors.New("invalid saved-send request")
+	}
+	for _, a := range r.Attachments {
+		if a.Name == "" || len(a.Name) > 240 || strings.ContainsAny(a.Name, "/\\\x00\r\n") || !accountPattern.MatchString(a.SHA256) || len(a.Data) > 28<<20 {
+			return errors.New("invalid send attachment")
+		}
+		data, err := base64.StdEncoding.Strict().DecodeString(a.Data)
+		hash := sha256.Sum256(data)
+		if err != nil || len(data) == 0 || len(data) > 20<<20 || hex.EncodeToString(hash[:]) != a.SHA256 {
+			return errors.New("invalid attachment content")
+		}
 	}
 	return nil
 }
 func (b Backend) Send(ctx context.Context, r SendRequest) (*SendResult, error) {
+	if !idPattern.MatchString(r.ConversationID) {
+		return nil, errors.New("saved browser sender requires a ChatGPT conversation")
+	}
 	if err := b.Validate(); err != nil {
 		return nil, err
 	}

@@ -5,14 +5,10 @@ own room. It uses the signed-in local collector from
 [alaq/codex-chatgpt-web](https://github.com/alaq/codex-chatgpt-web/tree/feat/saved-history-collector)
 and the [mautrix-go bridgev2 framework](https://github.com/mautrix/go).
 
-**Current milestone: a live encrypted pilot with saved-thread sending.** A dedicated
-Beeper bridge has discovered a synthetic saved conversation, mirrored its history
-and a fresh ChatGPT-side turn, and survived restart without duplicate rooms or
-messages. The saved sender was verified against the original ChatGPT conversation.
-A message sent from the operator's Beeper account continued that same saved thread,
-and its answer returned without an outbound echo. A separately created ordinary
-ChatGPT conversation also appeared as a new room without pairing. Work and Codex
-remain planned source adapters.
+**Current milestone: an encrypted bridge with recovery, media, source edits and
+conversation creation.** Local Work/Codex discovery is an opt-in pilot. Cloud Work
+conversations use their existing saved ChatGPT identity when present in regular
+history. Project matching and vault project links are outside this bridge.
 
 ## Behavior
 
@@ -33,9 +29,11 @@ remain planned source adapters.
 - Recovered sends retain the original Matrix event and client transaction IDs in
   their completion receipts, so clients can match them to the original outgoing
   message. Legacy outboxes resolve the client transaction from the verified event.
-- Visible user and assistant text is mirrored. Attachment counts link the reader
-  back to the original conversation. Hidden reasoning, raw nodes, and attachment
-  credentials are not exported.
+- Visible user and assistant text is mirrored. With `sync_media`, visible images,
+  attachments and linked sandbox downloads up to 20 MiB are fetched through the
+  authenticated backend and uploaded with Matrix encryption. Unavailable files keep
+  their source links and do not stop later text. Hidden reasoning, raw nodes and
+  signed download URLs are not exported.
 - Oversized messages are split into ordered parts below Matrix's encrypted event
   limit. Rich text and code remain readable; a failed part resumes without
   duplicating accepted parts or blocking the rest of the conversation forever.
@@ -50,8 +48,10 @@ remain planned source adapters.
 - Web citation markers become source links when the feed includes `citation_groups`.
   Unresolved citations link to the original ChatGPT conversation. Existing assistant
   messages receive an idempotent presentation edit; their event IDs and source hashes
-  stay unchanged. Ordinary source text edits and changes to an existing multipart
-  layout remain unsupported and pause that conversation for reconciliation.
+  stay unchanged. With `sync_edits`, source edits update existing events, including
+  growth/shrink of multipart answers. Superseded parts receive a short label. Branch
+  switches receive one notice; earlier branches remain as history. Source deletions
+  do not erase Matrix messages.
 
 ## Build and test
 
@@ -150,9 +150,10 @@ saved conversation URL. It preserves the selected web model; there is no separat
 API model or LLM router in this service. The existing Temporary Chat contract is
 unchanged.
 
-Only the operator's plain text messages in verified source rooms are accepted.
-Replies, edits, attachments and relayed senders are rejected in this pilot. Text is
-limited to 12,000 UTF-8 bytes. Multiline text is supported. Successful sends request
+Only the operator's normal messages in verified source rooms are accepted.
+Text is limited to 12,000 UTF-8 bytes. A single image/file/audio/video attachment
+up to 20 MiB can include a caption; its bytes and returned source receipt are checked.
+Quoted replies, edits, threads and relayed senders are rejected. Multiline text is supported. Successful sends request
 an immediate refresh after their original Matrix event is saved, so a slower idle
 polling interval does not delay fetching the answer. A private durable outbox records the original Matrix
 event before calling the backend. The backend writes a submission journal before
@@ -166,15 +167,55 @@ all conversations eligible under the persisted activation boundary. A historical
 `since` used during a pilot stays persisted: review that boundary before removing
 the test filter.
 
+## Commands and progress
+
+In the bridge management room, send `status`, `retry`, or `new <first message>`.
+In a conversation room, prefix commands with the configured bridge command prefix
+(default `!chatgpt`; check `bridge.command_prefix` in your configuration).
+
+`new` journals the Matrix command before creating a saved ChatGPT conversation.
+A lost result is reconciled against the original creation attempt. Use `retry`
+while that result is uncertain, rather than issuing a second `new` command.
+The new room appears through ordinary discovery. `retry` also recovers pending
+replies using their original Matrix/client transaction IDs.
+
+Accepted sends return their receipt before generation finishes. Typing is shown
+only after generation is observed. A timeout clears typing without claiming an
+answer completed. Unfinished source turns expose only their completed visible
+messages to the bridge; the personal archive's completed checkpoint stays behind
+them. `health_path` writes private timestamps/counts, including pending attachments.
+
+## Local Work/Codex pilot
+
+Configure `codex_home`, `codex_adapter` (this repository's `scripts/codex_source.py`),
+`codex_journal` and a separate RFC3339 `codex_since` activation date. The adapter
+reads the local task catalog and rollout records, excluding reasoning, tool calls,
+subagents and archived tasks. New or continued tasks appear as `Codex · …` rooms;
+completed visible progress and answers are mirrored. Source IDs are `codex:<UUID>`,
+so they cannot alias ChatGPT IDs. Shared cloud Work conversations retain their
+ChatGPT UUID and use `ChatGPT Work · …` titles when the source marks them `tpp`.
+
+Local task replies default to read-only. The experimental `codex_send_enabled`
+option requires a verified owner-routing endpoint in the running desktop app. It
+never launches a replacement agent or changes the task's model/permissions.
+If the installed app cannot expose the original task owner, continue in that app.
+Remote-host tasks, cloud Codex-only jobs, tool traces and local artifacts are not
+part of this first discovery pilot.
+
+## Automatic startup and recovery
+
+`scripts/supervise.py --config /absolute/private/services.json` owns only the
+configured browser and bridge children. It restarts them independently with
+bounded backoff and stops both on SIGTERM. Run it as a macOS login LaunchAgent;
+login/keychain/session verification can still require user interaction after reboot.
+See [operations](docs/operations.md) for the private configuration and rollout rules.
+
 ## Boundaries and remaining work
 
 - This pilot is single-operator. Treat configuration and the local backend checkout
   as trusted executable inputs. Restrict Matrix login permission to the operator.
 - Both directions have passed a live encrypted Beeper test. The ordinary saved
   history endpoint defines discovery coverage; this is still an early implementation.
-- Existing-message text edits are detected and pause that conversation rather than
-  generating duplicate messages. Branch switches/deletions are not reconciled with
-  previously mirrored history. That fidelity is required before general use.
 - The framework's database deduplicates acknowledged messages and normal restarts.
   Source messages now use deterministic Matrix transactions on both ghost and
   custom-user connections, including encrypted sends and Beeper URL prefixes.
@@ -183,8 +224,8 @@ the test filter.
   creation remain separate recovery cases; exactly-once delivery is not claimed.
   See [the validation plan](docs/validation.md).
 - Collection covers the regular saved-history endpoint. Project-only/archived-only
-  discovery, exhaustive history, attachment binaries, and long-running reliability
-  remain unverified.
+  discovery and exhaustive history remain unverified. Expired source assets cannot
+  always be recovered, and full Work/Codex artifacts/tool traces are outside this pilot.
 - Browser/session code stays in the backend fork. This repository owns Matrix
   rooms, source adapters, and delivery behavior. It does not file vault notes,
   approve project matches, or run an LLM for routing.

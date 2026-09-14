@@ -8,3 +8,5 @@
 .env
 /.runtime/
 /private/
+__pycache__/
+*.pyc
