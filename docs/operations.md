@@ -15,6 +15,7 @@ LaunchAgent with `RunAtLoad` and `KeepAlive`. The config must be mode 0600:
     "argv": ["/absolute/path/to/Electron", "/absolute/path/to/launcher", "--dev-profile"],
     "cwd": "/absolute/path/to/codex-chatgpt-web",
     "environment": {
+      "CODEX_WEB_GPT_DEV_HOME": "/absolute/private/existing-dev-profile",
       "CODEX_WEB_GPT_HISTORY_ENABLED": "1",
       "CODEX_WEB_GPT_SAVED_SEND_ENABLED": "1",
       "CODEX_WEB_GPT_SAVED_SEND_DIR": "/absolute/private/saved-send"
@@ -28,7 +29,10 @@ LaunchAgent with `RunAtLoad` and `KeepAlive`. The config must be mode 0600:
 ```
 
 Optional `metadata_path` and `metadata` fields update existing process inventories
-when a child restarts. `supervisor-status.json` records child PIDs and failure counts.
+when a child restarts. `supervisor-status.json` records child PIDs, process identities
+and failure counts. After a supervisor crash, only its still-matching recorded
+children are stopped before replacements start. Set the LaunchAgent `ExitTimeOut`
+to 45 seconds to allow graceful shutdown and the bounded child termination wait.
 Children restart independently after 2–120 seconds. A single file lock prevents two
 supervisors from owning the same runtime. Stop the supervisor through launchd when
 upgrading; killing a child alone deliberately restarts it. Before enabling it,

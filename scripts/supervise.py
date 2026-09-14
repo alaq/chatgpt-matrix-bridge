@@ -13,6 +13,7 @@ import signal
 import subprocess
 import time
 import stat
+import hashlib
 from datetime import datetime, timezone
 
 
@@ -24,6 +25,36 @@ def atomic_json(path, data):
         os.fsync(out.fileno())
     tmp.replace(path)
 
+def process_identity(pid):
+    """Bind a child PID/process group to its original start time across exec.
+
+    macOS's system Python is a launcher which changes its executable after Popen
+    returns. Command text therefore cannot identify the same child across exec.
+    """
+    result=subprocess.run(['ps','-p',str(pid),'-o','stat=','-o','lstart='],capture_output=True,text=True)
+    if result.returncode:return None
+    status,identity=result.stdout.strip().split(None,1)
+    if status.startswith('Z'):return None
+    try:
+        if os.getpgid(pid)!=pid:return None
+    except ProcessLookupError:return None
+    return hashlib.sha256((str(pid)+':'+identity).encode()).hexdigest()
+
+def stop_orphans(root):
+    previous=root/'supervisor-status.json'
+    if not previous.exists():return
+    state=json.loads(previous.read_text())
+    for child in state.get('children',{}).values():
+        pid=child.get('pid');identity=child.get('process_identity')
+        if not pid or not identity or process_identity(pid)!=identity:continue
+        try:os.killpg(pid,signal.SIGTERM)
+        except ProcessLookupError:continue
+        deadline=time.monotonic()+20
+        while time.monotonic()<deadline and process_identity(pid)==identity:time.sleep(.1)
+        if process_identity(pid)==identity:
+            try:os.killpg(pid,signal.SIGKILL)
+            except ProcessLookupError:pass
+
 
 def run(config_path):
     os.umask(0o077)
@@ -34,6 +65,7 @@ def run(config_path):
     root = config_path.parent
     lock = (root / 'supervisor.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    stop_orphans(root)
     children, stopping = {}, False
 
     def stop(_sig, _frame):
@@ -46,7 +78,7 @@ def run(config_path):
         spec = cfg[name]
         if not spec['argv'] or not Path(spec['argv'][0]).is_absolute() or not Path(spec['cwd']).is_absolute():
             raise ValueError('service commands and working directories must be absolute')
-        children[name] = dict(process=None, failures=0, next_start=0, started=0, spec=spec)
+        children[name] = dict(process=None, failures=0, next_start=0, started=0, spec=spec, identity=None)
     try:
         while not stopping:
             now = time.monotonic()
@@ -66,6 +98,7 @@ def run(config_path):
                             env={**os.environ, **cfg.get('environment', {}), **spec.get('environment', {})},
                             stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True)
                     state['started'] = now
+                    state['identity']=process_identity(state['process'].pid)
                     if spec.get('metadata_path'):
                         metadata_path=Path(spec['metadata_path'])
                         if not metadata_path.is_absolute():raise ValueError('process metadata path must be absolute')
@@ -74,6 +107,7 @@ def run(config_path):
             atomic_json(root / 'supervisor-status.json', {
                 'version': 1, 'pid': os.getpid(), 'checked_at': time.time(),
                 'children': {name: {'pid': state['process'].pid if state['process'] else None,
+                    'process_identity':state['identity'],
                     'running': state['process'] is not None and state['process'].poll() is None,
                     'consecutive_failures': state['failures']} for name, state in children.items()}})
             time.sleep(1)

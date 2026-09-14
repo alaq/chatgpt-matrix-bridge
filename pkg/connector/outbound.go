@@ -236,7 +236,7 @@ func (e *sourceMessage) PreHandle(ctx context.Context, portal *bridgev2.Portal) 
 }
 func (e *sourceMessage) ConvertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI) (*bridgev2.ConvertedMessage, error) {
 	if e.preError != nil {
-		return nil, e.preError
+		return nil, errors.Join(bridgev2.ErrIgnoringRemoteEvent, e.preError)
 	}
 	return e.PreConvertedMessage.ConvertMessage(ctx, portal, intent)
 }

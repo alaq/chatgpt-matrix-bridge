@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/alaq/chatgpt-matrix-bridge/internal/delivery"
@@ -22,12 +23,21 @@ func (c *Client) attachmentEvent(meta simplevent.EventMeta, chat source.Conversa
 			return bridgev2.UpsertResult{}, nil
 		},
 		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, a source.Attachment) (*bridgev2.ConvertedMessage, error) {
+			// bridgev2 emits a timeline error notice for ordinary conversion errors.
+			// That would consume this attachment's deterministic transaction before
+			// its actual file could be sent. Leave unavailable files retryable.
+			unavailable := func(err error) (*bridgev2.ConvertedMessage, error) {
+				c.health.mu.Lock()
+				c.health.PendingAttachments++
+				c.health.mu.Unlock()
+				return nil, errors.Join(bridgev2.ErrIgnoringRemoteEvent, err)
+			}
 			if err := c.recoverOutbound(ctx, portal); err != nil {
-				return nil, err
+				return unavailable(err)
 			}
 			original, err := c.connector.br.DB.Message.GetPartByID(ctx, portal.Receiver, networkid.MessageID(source.MessageID(account, chat.ID, message.ID)), "")
 			if err != nil {
-				return nil, err
+				return unavailable(err)
 			}
 			if original != nil {
 				if meta, ok := original.Metadata.(*MessageMetadata); ok {
@@ -40,11 +50,11 @@ func (c *Client) attachmentEvent(meta simplevent.EventMeta, chat source.Conversa
 			}
 			media, data, err := c.backend.Download(ctx, account, chat.ID, message.ID, a)
 			if err != nil {
-				return nil, err
+				return unavailable(err)
 			}
 			uri, encrypted, err := intent.UploadMedia(ctx, portal.MXID, data, media.Name, media.MimeType)
 			if err != nil {
-				return nil, err
+				return unavailable(err)
 			}
 			typ := event.MsgFile
 			if strings.HasPrefix(media.MimeType, "image/") {

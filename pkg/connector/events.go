@@ -17,6 +17,9 @@ func (c *Client) chatInfo(chat source.Conversation) *bridgev2.ChatInfo {
 	label := "ChatGPT"
 	if chat.Kind == "codex" {
 		label = "Codex"
+		if !c.connector.Config.CodexSendEnabled {
+			label = "Codex (read-only)"
+		}
 	} else if chat.Kind == "work" {
 		label = "ChatGPT Work"
 	}
@@ -25,10 +28,17 @@ func (c *Client) chatInfo(chat source.Conversation) *bridgev2.ChatInfo {
 		name = string([]rune(name)[:200])
 	}
 	participant := label
+	if chat.Kind == "codex" {
+		participant = "Codex"
+	}
 	if chat.Kind == "work" {
 		participant = "ChatGPT"
 	}
-	return &bridgev2.ChatInfo{Name: ptr.Ptr(name), Avatar: c.connector.avatar(), Topic: ptr.Ptr(chat.URL), Type: ptr.Ptr(database.RoomTypeDefault), JoinRule: &event.JoinRulesEventContent{JoinRule: event.JoinRuleInvite}, Members: &bridgev2.ChatMemberList{IsFull: true, Members: []bridgev2.ChatMember{
+	topic := chat.URL
+	if chat.Kind == "codex" && !c.connector.Config.CodexSendEnabled {
+		topic = "Read-only task mirror. Open the original task in the desktop app to continue: " + chat.URL
+	}
+	return &bridgev2.ChatInfo{Name: ptr.Ptr(name), Avatar: c.connector.avatar(), Topic: ptr.Ptr(topic), Type: ptr.Ptr(database.RoomTypeDefault), JoinRule: &event.JoinRulesEventContent{JoinRule: event.JoinRuleInvite}, Members: &bridgev2.ChatMemberList{IsFull: true, Members: []bridgev2.ChatMember{
 		{EventSender: bridgev2.EventSender{IsFromMe: true, Sender: c.userID(), SenderLogin: c.login.ID}, Membership: event.MembershipJoin, PowerLevel: ptr.Ptr(50)},
 		{EventSender: bridgev2.EventSender{Sender: c.sourceAssistantID(chat)}, UserInfo: &bridgev2.UserInfo{Name: ptr.Ptr(participant), Avatar: c.connector.avatar()}, Membership: event.MembershipJoin, PowerLevel: ptr.Ptr(50)},
 	}}, ExcludeChangesFromTimeline: true}

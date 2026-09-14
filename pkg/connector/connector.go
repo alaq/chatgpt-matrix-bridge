@@ -291,6 +291,9 @@ func (c *Client) dispatch(ctx context.Context, chat source.Conversation) error {
 			}
 		}
 		result := c.login.QueueRemoteEvent(evt)
+		if e, ok := evt.(*sourceMessage); ok && e.preError != nil {
+			return e.preError
+		}
 		if !result.Success {
 			if _, ok := evt.(*simplevent.Message[source.Attachment]); ok {
 				mediaFailures = append(mediaFailures, errors.New("attachment delivery pending"))
