@@ -70,6 +70,28 @@ installed app's IPC behavior. App releases can change it, and the original task'
 owner must be available. Never fall back to an unrelated CLI agent or widen the
 task's permissions. Native approvals remain in the desktop app.
 
+Before enabling `codex_send_enabled`, check the intended task without submitting
+or resuming it:
+
+```sh
+python3 scripts/codex_source.py --codex-home "$HOME/.codex" --conversation-id <task-uuid> probe
+```
+
+`available: true` means the running desktop app answered the task-owner lookup.
+It is a readiness check, not proof of a completed live send. A missing owner keeps
+the room read-only until the installed app's connection is verified. The official
+app-server continuation methods require a connection to the original server;
+starting another server over the same task store does not establish that connection.
+
+The sender starts an idle task through its existing owner and steers an unfinished
+turn through that same owner. It supplies no model, effort, permission or workspace
+overrides. Long periods without rollout activity only stop the typing indicator;
+they do not make an unfinished turn eligible for a new start. If an active turn
+ends during dispatch, an uncertain steering request is retained for reconciliation
+and is never replaced with a fresh start. A task-level process lock serializes
+duplicate requests, and an accepted reply must match both its client message ID
+and exact text in the original rollout.
+
 ## Verification
 
 Run Go tests with `-race -tags goolm`, Go vet/build, and Python tests in `scripts`.

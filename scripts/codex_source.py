@@ -6,6 +6,7 @@ running desktop app's owner-routing IPC so existing model/permission settings st
 with the original task. The app must be running; approvals remain in its UI.
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -37,7 +38,7 @@ def catalog(root):
     return db
 
 
-def read_thread(root, row):
+def read_thread(root, row, running_timeout=300):
     root = root.resolve()
     path = Path(row['rollout_path']).resolve()
     if not path.is_relative_to(root / 'sessions') and not path.is_relative_to(root / 'archived_sessions'):
@@ -85,7 +86,7 @@ def read_thread(root, row):
             seen.add(mid)
             messages.append({'id': mid, 'client_id': client_id, 'role': role, 'text': text,
                 'created_at': timestamp(record['timestamp']), 'attachment_count': 0})
-    return messages, active and time.time()-last_seen<300
+    return messages, active and (running_timeout is None or time.time()-last_seen < running_timeout)
 
 
 class DesktopIPC:
@@ -96,10 +97,14 @@ class DesktopIPC:
             raise ValueError('unsafe desktop socket')
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(20)
-        self.sock.connect(str(path))
         self.client_id = None
-        response = self.call('initialize', {'clientType': 'chatgpt-matrix-bridge'}, 0)
-        self.client_id = response['result']['clientId']
+        try:
+            self.sock.connect(str(path))
+            response = self.call('initialize', {'clientType': 'chatgpt-matrix-bridge'}, 0)
+            self.client_id = response['result']['clientId']
+        except Exception:
+            self.sock.close()
+            raise
 
     def write(self, data):
         raw = json.dumps(data).encode()
@@ -123,6 +128,7 @@ class DesktopIPC:
         self.write(request)
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
+            self.sock.settimeout(max(0.01, deadline - time.monotonic()))
             size = struct.unpack('<I', self.read(4))[0]
             if size <= 0 or size > 64 * 1024 * 1024:
                 raise ValueError('invalid desktop frame')
@@ -132,6 +138,10 @@ class DesktopIPC:
             if response.get('type') == 'response' and response.get('requestId') == request_id:
                 if response.get('resultType') != 'success':
                     raise ValueError('desktop request unavailable: ' + str(response.get('error')))
+                if response.get('method') != method or not response.get('handledByClientId'):
+                    raise ValueError('desktop response method/owner mismatch')
+                if target and response['handledByClientId'] != target:
+                    raise ValueError('desktop response from a different task owner')
                 return response
         raise TimeoutError('desktop request timed out')
 
@@ -166,6 +176,22 @@ def send(root, journal, request):
     info=journal.lstat()
     if journal.is_symlink() or info.st_uid!=os.getuid() or info.st_mode & 0o077:
         raise ValueError('unsafe local send journal')
+    # Serialize all transactions for this task, including another bridge process.
+    # A process dying after source acceptance must leave its record to reconcile.
+    lock = journal / (digest([str(root), cid]) + '.lock')
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError('unsafe local send lock')
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return send_locked(root, journal, request)
+    finally:
+        os.close(fd)
+
+
+def send_locked(root, journal, request):
+    cid, transaction = request['conversationId'], request['transactionId']
     file = journal / (transaction + '.json')
     if file.is_symlink() or file.exists() and (file.stat().st_uid!=os.getuid() or file.stat().st_mode & 0o077 or file.stat().st_size>8192):
         raise ValueError('unsafe local send record')
@@ -188,19 +214,23 @@ def send(root, journal, request):
         record.update(status='accepted', message_id=matches[0]['id'])
         atomic_record(file, record)
         return {'version': 1, 'status': 'accepted', 'userMessageId': record['message_id']}
-    if active:
-        return {'version': 1, 'status': 'not_sent', 'error': 'saved_send_source_busy'}
-    ipc = DesktopIPC(root)
+    try:
+        ipc = DesktopIPC(root)
+    except (OSError, ValueError, KeyError):
+        return {'version': 1, 'status': 'not_sent', 'error': 'codex_owner_unavailable'}
     try:
         try: owner = ipc.call('thread-owner-discovery', {'hostId': 'local', 'conversationId': cid[6:]})['handledByClientId']
-        except (ValueError,TimeoutError):
+        except (ValueError, OSError):
             return {'version':1,'status':'not_sent','error':'codex_owner_unavailable'}
         client_id = str(uuid.UUID(transaction[:32]))
-        record = {**identity, 'client_id': client_id, 'status': 'submitting'}
+        # Refresh immediately before choosing start vs. steer. The desktop owner
+        # remains responsible for an active-turn race; never fall back to a new
+        # start after an uncertain steering request.
+        _messages, active = read_thread(root, row, running_timeout=None)
+        method, params, version = turn_request(cid[6:], request['text'], client_id, row['cwd'], active)
+        record = {**identity, 'client_id': client_id, 'status': 'submitting', 'method': method}
         atomic_record(file, record)
-        ipc.call('thread-follower-start-turn', {'conversationId': cid[6:], 'turnStart': {
-            'request': {'threadId': cid[6:], 'input': [{'type': 'text', 'text': request['text']}], 'clientUserMessageId': client_id},
-            'context': {'inheritThreadSettings': True}}}, version=2, target=owner)
+        ipc.call(method, params, version=version, target=owner)
     finally:
         ipc.close()
     for _ in range(20):
@@ -213,14 +243,60 @@ def send(root, journal, request):
     return {'version': 1, 'status': 'uncertain', 'error': 'codex_send_uncertain'}
 
 
+def turn_request(thread_id, text, client_id, cwd, active):
+    """Use the original desktop owner, with no model or permission overrides."""
+    inputs = [{'type': 'text', 'text': text, 'text_elements': []}]
+    if not active:
+        return 'thread-follower-start-turn', {'conversationId': thread_id, 'turnStart': {
+            'request': {'threadId': thread_id, 'input': inputs, 'clientUserMessageId': client_id},
+            'context': {'inheritThreadSettings': True}}}, 2
+    if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+        raise ValueError('local task workspace unavailable')
+    return 'thread-follower-steer-turn', {'conversationId': thread_id,
+        'input': inputs, 'clientUserMessageId': client_id, 'attachments': [],
+        'restoreMessage': {'id': client_id, 'text': text, 'cwd': cwd,
+            'createdAt': int(time.time() * 1000), 'context': {'prompt': text,
+                'addedFiles': [], 'fileAttachments': [], 'imageAttachments': [],
+                'ideContext': None, 'workspaceRoots': [cwd]}}}, 1
+
+
+def probe(root, conversation_id):
+    """Read-only readiness check; never resume, open or submit to a task."""
+    if str(uuid.UUID(conversation_id)) != conversation_id:
+        raise ValueError('invalid task identity')
+    db = catalog(root)
+    try:
+        row = db.execute('SELECT * FROM threads WHERE id=? AND archived=0', (conversation_id,)).fetchone()
+    finally:
+        db.close()
+    if row is None:
+        return {'available': False, 'reason': 'codex_task_unavailable'}
+    _, active = read_thread(root, row)
+    try:
+        ipc = DesktopIPC(root)
+        try:
+            response = ipc.call('thread-owner-discovery', {'hostId': 'local', 'conversationId': conversation_id})
+            ready = bool(response['handledByClientId'])
+        finally:
+            ipc.close()
+    except (OSError, ValueError, KeyError):
+        ready = False
+    return {'available': ready, 'reason': None if ready else 'codex_owner_unavailable',
+        'running': active, 'conversationId': conversation_id}
+
+
 def atomic_record(file, record):
-    tmp = file.with_suffix('.tmp')
-    with tmp.open('w') as out:
-        json.dump(record, out); out.flush(); os.fsync(out.fileno())
-    tmp.replace(file)
-    fd = os.open(str(file.parent), os.O_RDONLY)
-    try: os.fsync(fd)
-    finally: os.close(fd)
+    tmp = file.with_suffix('.' + str(uuid.uuid4()) + '.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as out:
+            json.dump(record, out); out.flush(); os.fsync(out.fileno())
+        tmp.replace(file)
+        fd = os.open(str(file.parent), os.O_RDONLY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 if __name__ == '__main__':
@@ -229,11 +305,17 @@ if __name__ == '__main__':
     parser.add_argument('--codex-home', required=True)
     parser.add_argument('--since', type=float, default=0)
     parser.add_argument('--journal')
-    parser.add_argument('operation', choices=['feed', 'send'])
+    parser.add_argument('--conversation-id')
+    parser.add_argument('operation', choices=['feed', 'send', 'probe'])
     args = parser.parse_args()
     try:
         root = Path(args.codex_home).expanduser().resolve()
-        result = feed(root, args.since) if args.operation == 'feed' else send(root, Path(args.journal), json.loads(sys.stdin.buffer.read(80 * 1024)))
+        if args.operation == 'feed':
+            result = feed(root, args.since)
+        elif args.operation == 'probe':
+            result = probe(root, args.conversation_id)
+        else:
+            result = send(root, Path(args.journal), json.loads(sys.stdin.buffer.read(80 * 1024)))
         print(json.dumps(result))
     except Exception:
         if args.operation == 'send': print('{"version":1,"status":"uncertain","error":"codex_source_unavailable"}')
