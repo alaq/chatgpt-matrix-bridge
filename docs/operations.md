@@ -69,6 +69,14 @@ or expired files keep the original-conversation fallback.
 
 ## Local tasks
 
+The active polling limit does not limit where the owner can reply. Existing dormant
+rooms resolve their original source URL from the persisted portal, verified against
+its account-bound portal ID and current allowlist. A changed title or topic cannot
+route a message to a different conversation. Routing does not read old transcripts
+or enlarge the active cache; successful source activity lets the room reenter the
+normal bounded polling window. Codex replies also verify the persisted local-store
+binding before submission, including before the first successful poll after restart.
+
 Local Work/Codex discovery has its own activation date. Existing tasks updated after
 that date enter with their visible history; new tasks need no manual pairing.
 The default is read-only. Enable owner-routed replies only after verifying the

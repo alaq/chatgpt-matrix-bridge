@@ -5,14 +5,140 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/alaq/chatgpt-matrix-bridge/internal/source"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
+
+func TestDormantRoomReplySurvivesEvictionAndRestart(t *testing.T) {
+	for _, kind := range []string{"chatgpt", "codex"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "bridge.db")
+			mx := &matrixFixture{names: map[id.RoomID]string{}}
+			br, c := startFixture(t, path, mx)
+			chat := testChat()
+			if kind == "codex" {
+				chat.Kind, chat.ID, chat.URL = "codex", "codex:"+chat.ID, "codex://threads/"+chat.ID
+			}
+			// No delivery fingerprint: this also covers pre-optimization rooms.
+			feedFixture(t, br, c, chat)
+			account := c.login.Metadata.(*LoginMetadata).AccountKey
+			c.replaceActiveCache(account, nil)
+			msg := outgoingFixture(t, br, c)
+			if route, ok := c.conversationForPortal(msg.Portal); !ok || route.ID != chat.ID {
+				t.Fatal("eviction removed the durable route")
+			}
+			br.Stop()
+			br, c = startFixture(t, path, mx)
+			defer br.Stop()
+			msg = outgoingFixture(t, br, c)
+			if len(c.chats) != 0 {
+				t.Fatal("restart unexpectedly loaded a transcript cache")
+			}
+			calls := 0
+			c.sendFunc = func(_ context.Context, req source.SendRequest) (*source.SendResult, error) {
+				calls++
+				if req.ConversationID != chat.ID || req.AccountKey != account || req.Text != msg.Content.Body || req.TransactionID != source.StableID("matrix-send", account, string(msg.Portal.MXID), string(msg.Event.ID)) {
+					t.Fatal("dormant route changed original send identity")
+				}
+				return &source.SendResult{Version: 1, Status: "accepted", UserMessageID: "33333333-3333-3333-3333-333333333333"}, nil
+			}
+			response, err := c.HandleMatrixMessage(ctx, msg)
+			if err != nil || response == nil || response.DB.MXID != msg.Event.ID || calls != 1 {
+				t.Fatalf("dormant send: response=%v calls=%d err=%v", response, calls, err)
+			}
+			if err = br.DB.Message.Insert(ctx, response.DB); err != nil {
+				t.Fatal(err)
+			}
+			response.PostSave(ctx, response.DB)
+			if len(c.chats) != 0 {
+				t.Fatal("outbound routing expanded the active transcript cache")
+			}
+			chat.UpdatedAt += 100
+			chat.Messages = append(chat.Messages,
+				source.Message{ID: "33333333-3333-3333-3333-333333333333", Role: "user", Text: msg.Content.Body},
+				source.Message{ID: "returned-answer", Role: "assistant", Text: "Received"})
+			feedFixture(t, br, c, chat)
+			if mx.rooms != 1 || mx.messages != 3 || calls != 1 {
+				t.Fatalf("reactivation duplicated room/message: rooms=%d messages=%d calls=%d", mx.rooms, mx.messages, calls)
+			}
+		})
+	}
+}
+
+func TestDormantRoomRejectsUnboundRoutesAndDisallowedConversations(t *testing.T) {
+	ctx := context.Background()
+	mx := &matrixFixture{names: map[id.RoomID]string{}}
+	br, c := startFixture(t, filepath.Join(t.TempDir(), "bridge.db"), mx)
+	defer br.Stop()
+	chat := testChat()
+	feedFixture(t, br, c, chat)
+	c.replaceActiveCache(c.login.Metadata.(*LoginMetadata).AccountKey, nil)
+	msg := outgoingFixture(t, br, c)
+	c.sendFunc = func(context.Context, source.SendRequest) (*source.SendResult, error) {
+		t.Fatal("unbound route submitted")
+		return nil, nil
+	}
+	for _, topic := range []string{"", "https://evil.invalid/c/" + chat.ID, "https://chatgpt.com/c/22222222-2222-2222-2222-222222222222", chat.URL + "?thread=other", "codex://threads/" + chat.ID} {
+		msg.Portal.Topic = topic
+		if _, err := c.HandleMatrixMessage(ctx, msg); err == nil {
+			t.Fatalf("accepted unbound route %q", topic)
+		}
+	}
+	msg.Portal.Topic = chat.URL
+	c.connector.Config.AllowConversations = []string{"22222222-2222-2222-2222-222222222222"}
+	if _, err := c.HandleMatrixMessage(ctx, msg); err == nil {
+		t.Fatal("allowlist bypassed")
+	}
+	c.connector.Config.AllowConversations = nil
+	msg.Portal.Receiver = networkid.UserLoginID("another-login")
+	if _, err := c.HandleMatrixMessage(ctx, msg); err == nil {
+		t.Fatal("receiver binding bypassed")
+	}
+	if pending, err := c.getOutbound(ctx, msg.Portal); err != nil || pending != nil {
+		t.Fatal("rejected route created an outbox")
+	}
+}
+
+func TestDormantCodexCapabilitiesAndStoreBinding(t *testing.T) {
+	ctx := context.Background()
+	mx := &matrixFixture{names: map[id.RoomID]string{}}
+	br, c := startFixture(t, filepath.Join(t.TempDir(), "bridge.db"), mx)
+	defer br.Stop()
+	chat := testChat()
+	chat.Kind, chat.ID, chat.URL = "codex", "codex:"+chat.ID, "codex://threads/"+chat.ID
+	feedFixture(t, br, c, chat)
+	account := c.login.Metadata.(*LoginMetadata).AccountKey
+	c.replaceActiveCache(account, nil)
+	msg := outgoingFixture(t, br, c)
+	if got := c.GetCapabilities(ctx, msg.Portal); got.ID != "codex-readonly-v1" {
+		t.Fatalf("dormant room lost read-only capabilities: %#v", got)
+	}
+	c.connector.Config.CodexSendEnabled = true
+	if got := c.GetCapabilities(ctx, msg.Portal); len(got.File) != 0 {
+		t.Fatal("dormant Codex room advertised browser attachments")
+	}
+	for _, saved := range []string{"", source.StableID("local-task-store-v1", "/other/store")} {
+		c.connector.Config.CodexHome = "/configured/store"
+		if saved != "" {
+			_, err := br.DB.Exec(ctx, "INSERT INTO kv_store (bridge_id,key,value) VALUES ($1,$2,$3)", br.ID, "chatgpt_local_source_"+account, saved)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		result, err := c.send(ctx, source.SendRequest{Version: 1, AccountKey: account, ConversationID: chat.ID, TransactionID: strings.Repeat("b", 64), Text: "same task"})
+		if err != nil || result.Status != "not_sent" || result.Error != "codex_source_mismatch" {
+			t.Fatalf("store binding bypassed: %#v %v", result, err)
+		}
+	}
+}
 
 func outgoingFixture(t *testing.T, br *bridgev2.Bridge, c *Client) *bridgev2.MatrixMessage {
 	t.Helper()

@@ -439,9 +439,7 @@ func (c *Client) GetCapabilities(_ context.Context, portal *bridgev2.Portal) *ev
 			files[typ] = &event.FileFeatures{MimeTypes: map[string]event.CapabilitySupportLevel{"*/*": event.CapLevelPartialSupport}, Caption: event.CapLevelFullySupported, MaxCaptionLength: 12000, MaxSize: 20 << 20}
 		}
 		if portal != nil {
-			c.cacheMu.RLock()
-			chat := c.chats[string(portal.ID)]
-			c.cacheMu.RUnlock()
+			chat, _ := c.conversationForPortal(portal)
 			if chat.Kind == "codex" {
 				if !c.connector.Config.CodexSendEnabled {
 					return &event.RoomFeatures{ID: "codex-readonly-v1"}

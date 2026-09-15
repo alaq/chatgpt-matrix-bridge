@@ -72,6 +72,14 @@ func (c *Client) send(ctx context.Context, req source.SendRequest) (*source.Send
 		if !c.connector.Config.CodexSendEnabled {
 			return &source.SendResult{Version: 1, Status: "not_sent", Error: "codex_read_only"}, nil
 		}
+		// Dormant rooms can route before a new feed is loaded. Keep the local
+		// store binding enforced here as well as during source discovery.
+		var saved string
+		local := c.connector.Config.LocalTasks()
+		err := c.connector.br.DB.QueryRow(ctx, "SELECT value FROM kv_store WHERE bridge_id=$1 AND key=$2", c.connector.br.ID, "chatgpt_local_source_"+req.AccountKey).Scan(&saved)
+		if err != nil || !local.Enabled() || saved != source.StableID("local-task-store-v1", local.Home) {
+			return &source.SendResult{Version: 1, Status: "not_sent", Error: "codex_source_mismatch"}, nil
+		}
 		return c.connector.Config.LocalTasks().Send(ctx, req)
 	}
 	return c.backend.Send(ctx, req)
@@ -131,6 +139,35 @@ func (c *Client) finishRecovery(ctx context.Context, portal *bridgev2.Portal, ou
 func sendError(message string, certain bool) error {
 	return bridgev2.WrapErrorInStatus(errors.New(message)).WithIsCertain(certain).WithErrorAsMessage().WithSendNotice(true)
 }
+
+// Polling keeps only a bounded active cache. An existing portal's source URL is
+// also a durable route, but only when it hashes to that portal's account-bound ID.
+// Titles and arbitrary topic edits cannot redirect a reply to another task.
+func (c *Client) conversationForPortal(portal *bridgev2.Portal) (source.Conversation, bool) {
+	if portal == nil || portal.Receiver != c.login.ID || portal.MXID == "" {
+		return source.Conversation{}, false
+	}
+	c.cacheMu.RLock()
+	chat, ok := c.chats[string(portal.ID)]
+	c.cacheMu.RUnlock()
+	if !ok {
+		topic := strings.TrimPrefix(portal.Topic, "Read-only task mirror. Open the original task in the desktop app to continue: ")
+		switch {
+		case strings.HasPrefix(topic, "codex://threads/"):
+			chat = source.Conversation{ID: "codex:" + strings.TrimPrefix(topic, "codex://threads/"), Kind: "codex", URL: topic}
+		case strings.HasPrefix(topic, "https://chatgpt.com/c/"):
+			chat = source.Conversation{ID: strings.TrimPrefix(topic, "https://chatgpt.com/c/"), URL: topic}
+		default:
+			return source.Conversation{}, false
+		}
+	}
+	account := c.login.Metadata.(*LoginMetadata).AccountKey
+	if !c.connector.Config.allows(chat.ID) || source.PortalID(account, chat.ID) != string(portal.ID) {
+		return source.Conversation{}, false
+	}
+	return chat, true
+}
+
 func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	if !c.connector.Config.SendEnabled {
 		return nil, sendError("Sending into saved ChatGPT conversations is disabled in this bridge.", true)
@@ -142,11 +179,9 @@ func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMe
 	if (msg.Content.MsgType != event.MsgText && !isMedia) || msg.ReplyTo != nil || msg.ThreadRoot != nil || msg.Content.RelatesTo != nil {
 		return nil, sendError("Send text, an image, or a file as a normal message.", true)
 	}
-	c.cacheMu.RLock()
-	chat, ok := c.chats[string(msg.Portal.ID)]
-	c.cacheMu.RUnlock()
+	chat, ok := c.conversationForPortal(msg.Portal)
 	account := c.login.Metadata.(*LoginMetadata).AccountKey
-	if !ok || !c.connector.Config.allows(chat.ID) || source.PortalID(account, chat.ID) != string(msg.Portal.ID) {
+	if !ok {
 		return nil, sendError("Wait for this conversation to synchronize before sending.", true)
 	}
 	req := source.SendRequest{Version: 1, AccountKey: account, ConversationID: chat.ID, TransactionID: source.StableID("matrix-send", account, string(msg.Portal.MXID), string(msg.Event.ID)), Text: msg.Content.Body}
@@ -210,6 +245,8 @@ func rejectedSendMessage(code string) string {
 		return "This local task is mirrored read-only. Open it in the desktop app to continue it."
 	case "codex_owner_unavailable":
 		return "The desktop app could not route this reply to the original task. Nothing was submitted. Open the task in the app, then retry the original message."
+	case "codex_source_mismatch":
+		return "The local Codex source no longer matches this room. Nothing was submitted; restore the original task store before retrying."
 	case "codex_rollout_unavailable":
 		return "This Codex task is too large to bridge safely. Nothing was submitted; open the original task in the desktop app."
 	case "codex_turn_ended":
