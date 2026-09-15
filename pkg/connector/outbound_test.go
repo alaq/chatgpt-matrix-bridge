@@ -162,6 +162,14 @@ func TestUncertainOutboundPausesRoomAndRejectsWrongSender(t *testing.T) {
 	}
 }
 
+func TestOversizedCodexRolloutProducesActionableFailure(t *testing.T) {
+	got := rejectedSendMessage("codex_rollout_unavailable")
+	want := "This Codex task is too large to bridge safely. Nothing was submitted; open the original task in the desktop app."
+	if got != want {
+		t.Fatalf("oversized rollout notice is not actionable: %q", got)
+	}
+}
+
 func TestUnavailableTaskOwnerProducesVisibleOriginalMessageFailure(t *testing.T) {
 	ctx := context.Background()
 	mx := &matrixFixture{names: map[id.RoomID]string{}}

@@ -210,6 +210,8 @@ func rejectedSendMessage(code string) string {
 		return "This local task is mirrored read-only. Open it in the desktop app to continue it."
 	case "codex_owner_unavailable":
 		return "The desktop app could not route this reply to the original task. Nothing was submitted. Open the task in the app, then retry the original message."
+	case "codex_rollout_unavailable":
+		return "This Codex task is too large to bridge safely. Nothing was submitted; open the original task in the desktop app."
 	case "codex_turn_ended":
 		return "The Codex turn finished before this reply could join it. Nothing was submitted; retry the original message to continue the same task."
 	case "saved_send_draft_mismatch":

@@ -39,54 +39,79 @@ def catalog(root):
     return db
 
 
+class UnavailableRollout(ValueError):
+    pass
+
+
+class OversizedRollout(UnavailableRollout):
+    pass
+
+
 def read_thread(root, row, running_timeout=300):
     root = root.resolve()
     path = Path(row['rollout_path']).resolve()
     if not path.is_relative_to(root / 'sessions') and not path.is_relative_to(root / 'archived_sessions'):
         raise ValueError('rollout outside task store')
-    if path.stat().st_uid != os.getuid() or path.stat().st_size > 128 * 1024 * 1024:
-        raise ValueError('unavailable rollout')
+    limit = 128 * 1024 * 1024
     messages, seen, active, last_seen = [], set(), False, 0
-    with path.open() as stream:
-        for line in stream:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # an append may be in progress
-            if isinstance(record.get('timestamp'),str):last_seen=max(last_seen,timestamp(record['timestamp']))
-            payload = record.get('payload', {})
-            if record.get('type') == 'event_msg':
-                typ = payload.get('type')
-                if typ == 'task_started':
-                    active = True
-                elif typ in ('task_complete', 'turn_aborted'):
-                    active = False
-                item = payload.get('item', {}) if typ == 'item_completed' else {}
-                kind = item.get('type')
-                if kind not in ('UserMessage', 'AgentMessage'):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid():
+            raise UnavailableRollout('unavailable rollout')
+        if info.st_size > limit:
+            raise OversizedRollout('oversized rollout')
+        with os.fdopen(fd, 'rb') as stream:
+            fd = None
+            remaining = limit
+            while remaining:
+                line = stream.readline(remaining)
+                if not line:
+                    break
+                remaining -= len(line)
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # an append may be in progress
+                if isinstance(record.get('timestamp'),str):last_seen=max(last_seen,timestamp(record['timestamp']))
+                payload = record.get('payload', {})
+                if record.get('type') == 'event_msg':
+                    typ = payload.get('type')
+                    if typ == 'task_started':
+                        active = True
+                    elif typ in ('task_complete', 'turn_aborted'):
+                        active = False
+                    item = payload.get('item', {}) if typ == 'item_completed' else {}
+                    kind = item.get('type')
+                    if kind not in ('UserMessage', 'AgentMessage'):
+                        continue
+                    if kind == 'AgentMessage' and item.get('phase') not in (None, 'final_answer', 'final', 'commentary'):
+                        continue
+                    role = 'user' if kind == 'UserMessage' else 'assistant'
+                    text = '\n'.join(block['text'] for block in item.get('content', []) if isinstance(block, dict) and block.get('type') in ('text', 'Text') and isinstance(block.get('text'), str))
+                    mid = item.get('id')
+                    client_id = item.get('client_id')
+                elif record.get('type') == 'response_item' and payload.get('type') == 'message' and row['history_mode'] != 'paginated':
+                    role = payload.get('role')
+                    if role not in ('user', 'assistant') or role == 'assistant' and payload.get('channel') not in ('final', 'commentary'):
+                        continue
+                    text = '\n'.join(v['text'] for v in payload.get('content', []) if isinstance(v, dict) and isinstance(v.get('text'), str))
+                    if role == 'user' and text.startswith(('# AGENTS.md instructions', '<environment_context>', '<permissions instructions>')):
+                        continue
+                    mid = payload.get('id') or digest([row['id'], record.get('ordinal', record['timestamp']), role])
+                    client_id = None
+                else:
                     continue
-                if kind == 'AgentMessage' and item.get('phase') not in (None, 'final_answer', 'final', 'commentary'):
+                if not mid or mid in seen or not text.strip():
                     continue
-                role = 'user' if kind == 'UserMessage' else 'assistant'
-                text = '\n'.join(block['text'] for block in item.get('content', []) if isinstance(block, dict) and block.get('type') in ('text', 'Text') and isinstance(block.get('text'), str))
-                mid = item.get('id')
-                client_id = item.get('client_id')
-            elif record.get('type') == 'response_item' and payload.get('type') == 'message' and row['history_mode'] != 'paginated':
-                role = payload.get('role')
-                if role not in ('user', 'assistant') or role == 'assistant' and payload.get('channel') not in ('final', 'commentary'):
-                    continue
-                text = '\n'.join(v['text'] for v in payload.get('content', []) if isinstance(v, dict) and isinstance(v.get('text'), str))
-                if role == 'user' and text.startswith(('# AGENTS.md instructions', '<environment_context>', '<permissions instructions>')):
-                    continue
-                mid = payload.get('id') or digest([row['id'], record.get('ordinal', record['timestamp']), role])
-                client_id = None
-            else:
-                continue
-            if not mid or mid in seen or not text.strip():
-                continue
-            seen.add(mid)
-            messages.append({'id': mid, 'client_id': client_id, 'role': role, 'text': text,
-                'created_at': timestamp(record['timestamp']), 'attachment_count': 0})
+                seen.add(mid)
+                messages.append({'id': mid, 'client_id': client_id, 'role': role, 'text': text,
+                    'created_at': timestamp(record['timestamp']), 'attachment_count': 0})
+            if os.fstat(stream.fileno()).st_size > limit:
+                raise OversizedRollout('oversized rollout')
+    finally:
+        if fd is not None:
+            os.close(fd)
     return messages, active and (running_timeout is None or time.time()-last_seen < running_timeout)
 
 
@@ -215,15 +240,23 @@ def connect_owner(root, conversation_id):
 
 def feed(root, since):
     db = catalog(root)
-    rows = db.execute("SELECT * FROM threads WHERE updated_at>=? AND archived=0 AND source IN ('cli','vscode','exec','appServer') ORDER BY updated_at", (since,)).fetchall()
+    try:
+        rows = db.execute("SELECT * FROM threads WHERE updated_at>=? AND archived=0 AND source IN ('cli','vscode','exec','appServer') ORDER BY updated_at", (since,)).fetchall()
+    finally:
+        db.close()
     conversations = []
     for row in rows:
-        messages, active = read_thread(root, row)
+        try:
+            messages, active = read_thread(root, row)
+        except OversizedRollout:
+            # Keep one pathological local transcript from taking every ChatGPT
+            # and Codex room offline. Preserve its room identity, reject replies
+            # explicitly, and do not ingest bytes beyond the safety bound.
+            messages, active = [], False
         public = [{k: v for k, v in m.items() if k != 'client_id'} for m in messages]
         conversations.append({'id': 'codex:' + row['id'], 'kind': 'codex', 'title': row['name'] or row['title'] or 'Untitled task',
             'revision': digest([public, active]), 'url': 'codex://threads/' + row['id'], 'created_at': row['created_at'],
             'updated_at': row['updated_at'], 'messages': public, 'running': active})
-    db.close()
     return conversations
 
 
@@ -236,6 +269,17 @@ def send(root, journal, request):
     transaction = request.get('transactionId', '')
     if len(transaction) != 64 or any(c not in '0123456789abcdef' for c in transaction):
         raise ValueError('invalid transaction')
+    db = catalog(root)
+    try:
+        row = db.execute('SELECT * FROM threads WHERE id=? AND archived=0', (cid[6:],)).fetchone()
+    finally:
+        db.close()
+    if row is None:
+        raise ValueError('local task is unavailable')
+    try:
+        messages, active = read_thread(root, row)
+    except OversizedRollout:
+        return {'version': 1, 'status': 'not_sent', 'error': 'codex_rollout_unavailable'}
     journal.mkdir(parents=True, mode=0o700, exist_ok=True)
     info=journal.lstat()
     if journal.is_symlink() or info.st_uid!=os.getuid() or info.st_mode & 0o077:
@@ -249,12 +293,12 @@ def send(root, journal, request):
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise ValueError('unsafe local send lock')
         fcntl.flock(fd, fcntl.LOCK_EX)
-        return send_locked(root, journal, request)
+        return send_locked(root, journal, request, row, messages, active)
     finally:
         os.close(fd)
 
 
-def send_locked(root, journal, request):
+def send_locked(root, journal, request, row, messages, active):
     cid, transaction = request['conversationId'], request['transactionId']
     file = journal / (transaction + '.json')
     if file.is_symlink() or file.exists() and (file.stat().st_uid!=os.getuid() or file.stat().st_mode & 0o077 or file.stat().st_size>8192):
@@ -263,12 +307,6 @@ def send_locked(root, journal, request):
     record = json.loads(file.read_text()) if file.exists() else None
     if record and any(record[k] != v for k, v in identity.items()):
         raise ValueError('transaction conflict')
-    db = catalog(root)
-    row = db.execute('SELECT * FROM threads WHERE id=? AND archived=0', (cid[6:],)).fetchone()
-    db.close()
-    if row is None:
-        raise ValueError('local task is unavailable')
-    messages, active = read_thread(root, row)
     if record and record.get('status') != 'not_sent':
         if record.get('status') == 'accepted':
             return {'version': 1, 'status': 'accepted', 'userMessageId': record['message_id']}
@@ -278,6 +316,17 @@ def send_locked(root, journal, request):
         record.update(status='accepted', message_id=matches[0]['id'])
         atomic_record(file, record)
         return {'version': 1, 'status': 'accepted', 'userMessageId': record['message_id']}
+    db = catalog(root)
+    try:
+        row = db.execute('SELECT * FROM threads WHERE id=? AND archived=0', (cid[6:],)).fetchone()
+    finally:
+        db.close()
+    if row is None:
+        return {'version': 1, 'status': 'not_sent', 'error': 'codex_owner_unavailable'}
+    try:
+        _messages, active = read_thread(root, row, running_timeout=None)
+    except OversizedRollout:
+        return {'version': 1, 'status': 'not_sent', 'error': 'codex_rollout_unavailable'}
     try:
         ipc, owner = connect_owner(root, cid[6:])
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
@@ -296,7 +345,10 @@ def send_locked(root, journal, request):
         # Refresh immediately before choosing start vs. steer. The desktop owner
         # remains responsible for an active-turn race; never fall back to a new
         # start after an uncertain steering request.
-        _messages, active = read_thread(root, row, running_timeout=None)
+        try:
+            _messages, active = read_thread(root, row, running_timeout=None)
+        except OversizedRollout:
+            return {'version': 1, 'status': 'not_sent', 'error': 'codex_rollout_unavailable'}
         method, params, version = turn_request(cid[6:], request['text'], client_id, row['cwd'], active)
         record = {**identity, 'client_id': client_id, 'status': 'submitting', 'method': method}
         atomic_record(file, record)

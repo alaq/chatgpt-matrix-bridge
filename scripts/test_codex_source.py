@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,7 +9,7 @@ from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from unittest.mock import patch
-from codex_source import read_thread, send, probe, DesktopIPC, DesktopRequestError, open_original_task
+from codex_source import feed, read_thread, send, probe, DesktopIPC, DesktopRequestError, UnavailableRollout, OversizedRollout, open_original_task
 
 class CodexTests(unittest.TestCase):
     def test_only_completed_visible_items_and_stable_identity(self):
@@ -30,6 +31,79 @@ class CodexTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);path=root/'outside.jsonl';path.write_text('')
             with self.assertRaises(ValueError):read_thread(root,{'rollout_path':str(path)})
+
+    def test_feed_keeps_other_tasks_when_one_rollout_exceeds_safety_bound(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'sessions').mkdir()
+            valid=root/'sessions/valid.jsonl';valid.write_text('')
+            oversized=root/'sessions/oversized.jsonl'
+            with oversized.open('wb') as stream:
+                stream.truncate(128 * 1024 * 1024 + 1)
+            with closing(sqlite3.connect(root/'state_1.sqlite')) as db:
+                db.execute('CREATE TABLE threads (id TEXT, rollout_path TEXT, history_mode TEXT, archived INTEGER, source TEXT, name TEXT, title TEXT, created_at REAL, updated_at REAL)')
+                db.executemany('INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?)', [
+                    ('valid',str(valid),'paginated',0,'cli','Valid',None,1,3),
+                    ('oversized',str(oversized),'paginated',0,'cli','Oversized',None,1,2),
+                ])
+                db.commit()
+            result=feed(root,0)
+            self.assertEqual([chat['id'] for chat in result],['codex:oversized','codex:valid'])
+            self.assertEqual(result[0]['messages'],[])
+
+    def test_read_thread_rejects_growth_beyond_safety_bound_after_open(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'sessions').mkdir();path=root/'sessions/growing.jsonl'
+            with path.open('wb') as stream:
+                stream.truncate(128 * 1024 * 1024)
+            real_fstat=os.fstat
+            real_fdopen=os.fdopen
+            grown=False
+            bytes_returned=0
+            def grow_after_fstat(fd):
+                nonlocal grown
+                info=real_fstat(fd)
+                if not grown:
+                    grown=True
+                    with path.open('ab') as stream:
+                        stream.write(b'x')
+                return info
+            class TrackingStream:
+                def __init__(self, fd, mode): self.stream=real_fdopen(fd,mode)
+                def __enter__(self): return self
+                def __exit__(self,*args): return self.stream.__exit__(*args)
+                def fileno(self): return self.stream.fileno()
+                def readline(self, size=-1):
+                    nonlocal bytes_returned
+                    data=self.stream.readline(size);bytes_returned+=len(data);return data
+            with patch('codex_source.os.fstat',side_effect=grow_after_fstat), \
+                 patch('codex_source.os.fdopen',side_effect=TrackingStream):
+                with self.assertRaises(ValueError):
+                    read_thread(root,{'rollout_path':str(path),'history_mode':'paginated'})
+            self.assertLessEqual(bytes_returned,128 * 1024 * 1024)
+
+    def test_nonowner_rollout_is_not_suppressed_as_oversized(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'sessions').mkdir();path=root/'sessions/nonowner.jsonl';path.write_text('')
+            with closing(sqlite3.connect(root/'state_1.sqlite')) as db:
+                db.execute('CREATE TABLE threads (id TEXT, rollout_path TEXT, history_mode TEXT, archived INTEGER, source TEXT, name TEXT, title TEXT, created_at REAL, updated_at REAL)')
+                db.execute('INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?)',
+                           ('nonowner',str(path),'paginated',0,'cli','Nonowner',None,1,2))
+                db.commit()
+            info=path.stat()
+            connection=sqlite3.connect(root/'state_1.sqlite');connection.row_factory=sqlite3.Row
+            class TrackingCatalog:
+                closed=False
+                def execute(self,*args): return connection.execute(*args)
+                def close(self): self.closed=True;connection.close()
+            tracked=TrackingCatalog()
+            try:
+                with patch('codex_source.catalog',return_value=tracked), \
+                     patch('codex_source.os.fstat',return_value=type('Info',(),{'st_uid':os.getuid()+1,'st_size':info.st_size})()):
+                    with self.assertRaises(UnavailableRollout):
+                        feed(root,0)
+                self.assertTrue(tracked.closed)
+            finally:
+                if not tracked.closed: connection.close()
 
 
 
@@ -118,6 +192,37 @@ class SendTests(unittest.TestCase):
         self.assertEqual(send(self.root,self.journal,self.req),result)
         self.assertEqual(len(self.calls),1)
         self.assertEqual(self.activation_ids, [])
+
+    def test_oversized_rollout_rejects_reply_before_submission(self):
+        with self.rollout.open('wb') as stream:
+            stream.truncate(128 * 1024 * 1024 + 1)
+        result = send(self.root, self.journal, self.req)
+        self.assertEqual(result, {'version': 1, 'status': 'not_sent',
+                                  'error': 'codex_rollout_unavailable'})
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.activation_ids, [])
+        self.assertFalse(self.journal.exists())
+
+    def test_send_closes_catalog_when_initial_query_fails(self):
+        class BrokenCatalog:
+            closed=False
+            def execute(self,*_args): raise sqlite3.OperationalError('malformed catalog')
+            def close(self): self.closed=True
+        catalog=BrokenCatalog()
+        with patch('codex_source.catalog',return_value=catalog):
+            with self.assertRaises(sqlite3.OperationalError):
+                send(self.root,self.journal,self.req)
+        self.assertTrue(catalog.closed)
+        self.assertFalse(self.journal.exists())
+
+    def test_rollout_growth_after_preflight_rejects_before_owner_lookup(self):
+        with patch('codex_source.read_thread', side_effect=[([],False),OversizedRollout('oversized rollout')]):
+            result = send(self.root, self.journal, self.req)
+        self.assertEqual(result, {'version': 1, 'status': 'not_sent',
+                                  'error': 'codex_rollout_unavailable'})
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.activation_ids, [])
+        self.assertEqual(list(self.journal.glob('*.json')), [])
 
     def test_active_turn_is_steered_even_after_long_silence(self):
         self.record({'type':'task_started','turn_id':'active-turn'},'2026-09-01T00:00:00Z')
