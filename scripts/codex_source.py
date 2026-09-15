@@ -238,10 +238,19 @@ def connect_owner(root, conversation_id):
     raise DesktopRequestError('no-client-found')
 
 
-def feed(root, since):
+def feed(root, since, max_conversations=10, allowed_conversations=None):
+    if not isinstance(max_conversations, int) or isinstance(max_conversations, bool) or not 1 <= max_conversations <= 100:
+        raise ValueError('max conversations must be between 1 and 100')
+    allowed = [item[6:] for item in (allowed_conversations or []) if isinstance(item, str) and item.startswith('codex:')]
     db = catalog(root)
     try:
-        rows = db.execute("SELECT * FROM threads WHERE updated_at>=? AND archived=0 AND source IN ('cli','vscode','exec','appServer') ORDER BY updated_at", (since,)).fetchall()
+        rows = db.execute("""SELECT * FROM (
+            SELECT * FROM threads
+            WHERE updated_at>=? AND archived=0 AND source IN ('cli','vscode','exec','appServer')
+              AND (?=0 OR id IN (SELECT value FROM json_each(?)))
+            ORDER BY updated_at DESC, id DESC LIMIT ?
+          ) ORDER BY updated_at, id""",
+          (since, int(bool(allowed_conversations)), json.dumps(allowed), max_conversations)).fetchall()
     finally:
         db.close()
     conversations = []
@@ -442,6 +451,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--codex-home', required=True)
     parser.add_argument('--since', type=float, default=0)
+    parser.add_argument('--max-conversations', type=int, default=10)
+    parser.add_argument('--allow-conversation', action='append', default=[])
     parser.add_argument('--journal')
     parser.add_argument('--conversation-id')
     parser.add_argument('operation', choices=['feed', 'send', 'probe', 'reconnect'])
@@ -449,7 +460,7 @@ if __name__ == '__main__':
     try:
         root = Path(args.codex_home).expanduser().resolve()
         if args.operation == 'feed':
-            result = feed(root, args.since)
+            result = feed(root, args.since, args.max_conversations, args.allow_conversation)
         elif args.operation in ('probe', 'reconnect'):
             result = probe(root, args.conversation_id, reconnect=args.operation == 'reconnect')
         else:

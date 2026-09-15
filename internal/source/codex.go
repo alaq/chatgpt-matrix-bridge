@@ -18,6 +18,8 @@ import (
 type LocalTasks struct {
 	Python, Adapter, Home, Journal string
 	Since                          float64
+	MaxConversations               int
+	AllowConversations             []string
 }
 
 func (b LocalTasks) Enabled() bool { return b.Home != "" }
@@ -39,7 +41,16 @@ func (b LocalTasks) run(ctx context.Context, op string, request *SendRequest) ([
 	}
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, b.Python, b.Adapter, "--codex-home", b.Home, "--journal", b.Journal, "--since", strconv.FormatFloat(b.Since, 'f', 3, 64), op)
+	limit := b.MaxConversations
+	if limit == 0 {
+		limit = 10
+	}
+	argv := []string{b.Adapter, "--codex-home", b.Home, "--journal", b.Journal, "--since", strconv.FormatFloat(b.Since, 'f', 3, 64), "--max-conversations", strconv.Itoa(limit)}
+	for _, id := range b.AllowConversations {
+		argv = append(argv, "--allow-conversation", id)
+	}
+	argv = append(argv, op)
+	cmd := exec.CommandContext(ctx, b.Python, argv...)
 	if request != nil {
 		data, _ := json.Marshal(request)
 		cmd.Stdin = bytes.NewReader(data)

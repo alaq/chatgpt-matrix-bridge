@@ -91,8 +91,8 @@ func TestBackendContractRoundTripAndCancellation(t *testing.T) {
 	os.MkdirAll(scripts, 0700)
 	raw, _ := json.Marshal(sample())
 	path := filepath.Join(scripts, "cli.py")
-	os.WriteFile(path, []byte("print("+string(mustJSON(string(raw)))+")\n"), 0600)
-	b := Backend{Python: "python3", Directory: dir, Archive: dir}
+	os.WriteFile(path, []byte("import sys\nassert sys.argv[-4:] == ['--max-conversations', '10', '--allow-conversation', 'allowed']\nprint("+string(mustJSON(string(raw)))+")\n"), 0600)
+	b := Backend{Python: "python3", Directory: dir, Archive: dir, MaxConversations: 10, AllowConversations: []string{"allowed"}}
 	s, err := b.Read(context.Background())
 	if err != nil || len(s.Conversations) != 1 {
 		t.Fatalf("contract: %v", err)

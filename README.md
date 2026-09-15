@@ -20,6 +20,10 @@ history. Project matching and vault project links are outside this bridge.
 - The first login stores an activation timestamp. It survives normal restarts and
   relogin; set `network.since` before first login to include an older window.
 - Each poll runs the existing bounded incremental collector, then reads a snapshot.
+  Only the ten most recently updated eligible conversations are active by default,
+  across ChatGPT, Work and Codex combined. Older room mappings and history remain;
+  updating an older source conversation brings its existing room back into the
+  active set without creating a duplicate.
   Default polling is 60 seconds plus collection/delivery time, not a latency SLA.
   Failed polls back off from at least one minute to 15 minutes (or a longer configured
   interval). Last captured, account-bound history remains available for local delivery
@@ -106,6 +110,7 @@ network:
   archive_dir: /absolute/path/to/private/archive
   descriptor: /absolute/path/to/launcher-browser.json
   poll_seconds: 60
+  max_active_conversations: 10
   since: ""
   allow_conversations: []
   send_enabled: false
@@ -161,11 +166,14 @@ clicking Send, verifies the accepted source message and reconciles repeated call
 with the same transaction ID. An unresolved attempt pauses the room; sending a new
 message is not a safe retry. Keep both the bridge database and backend journal.
 
-Set `network.allow_conversations` to explicit source UUIDs for a bounded pilot.
-This is an optional test filter, not a room-pairing mechanism. An empty list selects
-all conversations eligible under the persisted activation boundary. A historical
-`since` used during a pilot stays persisted: review that boundary before removing
-the test filter.
+`network.max_active_conversations` defaults to 10 and is bounded from 1 to 100.
+Each source exports only its newest candidates, then the bridge selects the newest
+configured count across sources. This bounds transcript parsing and Matrix replay;
+it does not delete old Matrix rooms or source history. A dormant room becomes
+active again when its source conversation is updated. Set
+`network.allow_conversations` to explicit source UUIDs for a narrower pilot; the
+active cap still applies. A historical `since` used during a pilot stays persisted:
+review that boundary before removing the test filter.
 
 ## Commands and progress
 
@@ -189,8 +197,8 @@ them. `health_path` writes private timestamps/counts, including pending attachme
 
 Configure `codex_home`, `codex_adapter` (this repository's `scripts/codex_source.py`),
 `codex_journal` and a separate RFC3339 `codex_since` activation date. The adapter
-reads the local task catalog and rollout records, excluding reasoning, tool calls,
-subagents and archived tasks. New or continued tasks appear as `Codex · …` rooms;
+selects the newest configured task rows before opening rollout files, excluding
+reasoning, tool calls, subagents and archived tasks from the exported messages. New or continued tasks appear as `Codex · …` rooms;
 completed visible progress and answers are mirrored. Source IDs are `codex:<UUID>`,
 so they cannot alias ChatGPT IDs. Shared cloud Work conversations retain their
 ChatGPT UUID and use `ChatGPT Work · …` titles when the source marks them `tpp`.

@@ -50,6 +50,22 @@ class CodexTests(unittest.TestCase):
             self.assertEqual([chat['id'] for chat in result],['codex:oversized','codex:valid'])
             self.assertEqual(result[0]['messages'],[])
 
+    def test_feed_reads_only_the_ten_most_recent_tasks(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'sessions').mkdir()
+            rows=[]
+            for index in range(12):
+                path=root/'sessions'/f'{index}.jsonl';path.write_text('')
+                rows.append((str(index),str(path),'paginated',0,'cli',f'Task {index}',None,1,index))
+            with closing(sqlite3.connect(root/'state_1.sqlite')) as db:
+                db.execute('CREATE TABLE threads (id TEXT, rollout_path TEXT, history_mode TEXT, archived INTEGER, source TEXT, name TEXT, title TEXT, created_at REAL, updated_at REAL)')
+                db.executemany('INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?)', rows)
+                db.commit()
+            result=feed(root,0,10)
+            self.assertEqual([chat['id'] for chat in result], [f'codex:{index}' for index in range(2,12)])
+            allowed=feed(root,0,10,['codex:0'])
+            self.assertEqual([chat['id'] for chat in allowed], ['codex:0'])
+
     def test_read_thread_rejects_growth_beyond_safety_bound_after_open(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);(root/'sessions').mkdir();path=root/'sessions/growing.jsonl'

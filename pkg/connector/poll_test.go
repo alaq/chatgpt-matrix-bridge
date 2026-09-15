@@ -22,7 +22,7 @@ func TestRefreshFailureStillDeliversVerifiedArchiveAndReportsDisconnected(t *tes
 		t.Fatal(err)
 	}
 	script := `import json, sys
-if sys.argv[-1] != 'feed': sys.exit(1)
+if 'feed' not in sys.argv or sys.argv[-2:] != ['--max-conversations', '10']: sys.exit(1)
 print(json.dumps({'version':1,'source':'chatgpt','account_key':'` + strings.Repeat("a", 64) + `','conversations':[{'id':'11111111-1111-1111-1111-111111111111','revision':'` + strings.Repeat("b", 64) + `','title':'Cached','url':'https://chatgpt.com/c/11111111-1111-1111-1111-111111111111','created_at':100,'updated_at':200,'messages':[{'id':'a','role':'assistant','text':'**Cached answer**'}]}]}))
 `
 	if err := os.WriteFile(filepath.Join(root, "scripts/history/cli.py"), []byte(script), 0600); err != nil {

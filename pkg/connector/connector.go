@@ -221,11 +221,10 @@ func (c *Client) deliverArchive(ctx context.Context) error {
 			failures = append(failures, err)
 		}
 	}
-	c.cacheMu.Lock()
-	for _, chat := range chats {
-		c.chats[source.PortalID(meta.AccountKey, chat.ID)] = chat
+	chats = c.connector.Config.selectActive(chats)
+	if len(failures) == 0 {
+		c.replaceActiveCache(meta.AccountKey, chats)
 	}
-	c.cacheMu.Unlock()
 	for _, chat := range chats {
 		if !c.connector.Config.allows(chat.ID) {
 			continue
@@ -238,6 +237,16 @@ func (c *Client) deliverArchive(ctx context.Context) error {
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func (c *Client) replaceActiveCache(account string, chats []source.Conversation) {
+	next := make(map[string]source.Conversation, len(chats))
+	for _, chat := range chats {
+		next[source.PortalID(account, chat.ID)] = chat
+	}
+	c.cacheMu.Lock()
+	c.chats = next
+	c.cacheMu.Unlock()
 }
 
 func nextPollDelay(normal time.Duration, failures int) time.Duration {

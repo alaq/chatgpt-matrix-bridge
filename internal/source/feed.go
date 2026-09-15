@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -147,7 +148,11 @@ func Select(s *Snapshot, account string, since float64) ([]Conversation, error) 
 	return out, nil
 }
 
-type Backend struct{ Python, Directory, Archive, Descriptor string }
+type Backend struct {
+	Python, Directory, Archive, Descriptor string
+	MaxConversations                       int
+	AllowConversations                     []string
+}
 
 func (b Backend) Validate() error {
 	if b.Python == "" || !filepath.IsAbs(b.Directory) || !filepath.IsAbs(b.Archive) || (b.Descriptor != "" && !filepath.IsAbs(b.Descriptor)) {
@@ -196,7 +201,15 @@ func (b Backend) run(ctx context.Context, command string, args ...string) ([]byt
 func (b Backend) Read(ctx context.Context) (*Snapshot, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	data, err := b.run(ctx, "feed")
+	limit := b.MaxConversations
+	if limit == 0 {
+		limit = 10
+	}
+	args := []string{"--max-conversations", strconv.Itoa(limit)}
+	for _, id := range b.AllowConversations {
+		args = append(args, "--allow-conversation", id)
+	}
+	data, err := b.run(ctx, "feed", args...)
 	if err != nil {
 		return nil, err
 	}
