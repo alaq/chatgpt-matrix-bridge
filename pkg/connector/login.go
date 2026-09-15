@@ -55,7 +55,7 @@ func (p *loginProcess) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	if err := backend.Refresh(ctx); err != nil {
 		return nil, err
 	}
-	snapshot, err := backend.Read(ctx)
+	snapshot, err := backend.Read(ctx, nil)
 	if err != nil {
 		return nil, err
 	}

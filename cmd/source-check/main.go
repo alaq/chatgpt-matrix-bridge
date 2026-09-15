@@ -36,7 +36,7 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	snapshot, err := b.Read(ctx)
+	snapshot, err := b.Read(ctx, nil)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

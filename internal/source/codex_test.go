@@ -37,13 +37,15 @@ func TestLocalTasksPassesActiveConversationLimitToAdapter(t *testing.T) {
 args=sys.argv[1:]
 assert args[args.index('--max-conversations')+1] == '10'
 assert args[args.index('--allow-conversation')+1] == 'codex:allowed'
+assert args[args.index('--known-conversation')+1] == 'codex:11111111-1111-1111-1111-111111111111=` + strings.Repeat("e", 64) + `'
 print('[]')
 `
 	if err := os.WriteFile(adapter, []byte(script), 0600); err != nil {
 		t.Fatal(err)
 	}
 	b := LocalTasks{Python: "python3", Adapter: adapter, Home: dir, Journal: filepath.Join(dir, "journal"), Since: 1, AllowConversations: []string{"codex:allowed"}}
-	if _, err := b.Read(context.Background(), strings.Repeat("a", 64)); err != nil {
+	known := map[string]Conversation{"codex:11111111-1111-1111-1111-111111111111": {DeliveryFingerprint: strings.Repeat("e", 64)}}
+	if _, err := b.Read(context.Background(), strings.Repeat("a", 64), known); err != nil {
 		t.Fatal(err)
 	}
 }

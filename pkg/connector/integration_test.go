@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -257,5 +258,48 @@ func TestFrameworkRetriesFailedDeliveryWithoutAdvancingPastIt(t *testing.T) {
 	}
 	if mx.messages != 2 {
 		t.Fatal("unsupported edit generated duplicate message")
+	}
+}
+
+func TestDeliveryFingerprintPersistsOnlyAfterCompleteDispatch(t *testing.T) {
+	mx := &matrixFixture{names: map[id.RoomID]string{}, failNext: true}
+	br, c := startFixture(t, filepath.Join(t.TempDir(), "bridge.db"), mx)
+	defer br.Stop()
+	chat := testChat()
+	chat.Revision = strings.Repeat("b", 64)
+	chat.DeliveryFingerprint = strings.Repeat("e", 64)
+	if err := c.dispatch(context.Background(), chat); err == nil {
+		t.Fatal("injected delivery failure reported success")
+	}
+	known, err := c.loadDelivered(context.Background())
+	if err != nil || len(known) != 0 {
+		t.Fatalf("failed dispatch advanced fingerprint: %+v %v", known, err)
+	}
+	if err := c.dispatch(context.Background(), chat); err != nil {
+		t.Fatal(err)
+	}
+	known, err = c.loadDelivered(context.Background())
+	if err != nil || known[chat.ID].DeliveryFingerprint != chat.DeliveryFingerprint || len(known[chat.ID].Messages) != 0 {
+		t.Fatalf("successful dispatch did not persist minimal delivery state: %+v %v", known, err)
+	}
+}
+
+func TestUnchangedConversationSkipsMatrixDispatch(t *testing.T) {
+	mx := &matrixFixture{names: map[id.RoomID]string{}}
+	br, c := startFixture(t, filepath.Join(t.TempDir(), "bridge.db"), mx)
+	defer br.Stop()
+	chat := testChat()
+	chat.Revision = strings.Repeat("b", 64)
+	chat.DeliveryFingerprint = strings.Repeat("e", 64)
+	if err := c.dispatch(context.Background(), chat); err != nil {
+		t.Fatal(err)
+	}
+	beforeRooms, beforeMessages := mx.rooms, mx.messages
+	chat.Unchanged = true
+	if err := c.dispatchConversation(context.Background(), chat); err != nil {
+		t.Fatal(err)
+	}
+	if mx.rooms != beforeRooms || mx.messages != beforeMessages {
+		t.Fatal("unchanged conversation was redispatched")
 	}
 }

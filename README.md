@@ -24,6 +24,11 @@ history. Project matching and vault project links are outside this bridge.
   across ChatGPT, Work and Codex combined. Older room mappings and history remain;
   updating an older source conversation brings its existing room back into the
   active set without creating a duplicate.
+- After a conversation is completely delivered, the bridge persists a versioned
+  delivery fingerprint. Later polls use cheap source metadata to return an unchanged
+  marker instead of reopening/decoding that transcript or redispatching its events.
+  Failed or partial delivery never advances the fingerprint; outbox recovery and
+  running-task typing refresh still happen on every applicable poll.
   Default polling is 60 seconds plus collection/delivery time, not a latency SLA.
   Failed polls back off from at least one minute to 15 minutes (or a longer configured
   interval). Last captured, account-bound history remains available for local delivery

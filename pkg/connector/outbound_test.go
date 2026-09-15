@@ -162,6 +162,40 @@ func TestUncertainOutboundPausesRoomAndRejectsWrongSender(t *testing.T) {
 	}
 }
 
+func TestUnchangedConversationRecoversPendingOutbound(t *testing.T) {
+	ctx := context.Background()
+	mx := &matrixFixture{names: map[id.RoomID]string{}}
+	br, c := startFixture(t, filepath.Join(t.TempDir(), "bridge.db"), mx)
+	defer br.Stop()
+	chat := testChat()
+	feedFixture(t, br, c, chat)
+	msg := outgoingFixture(t, br, c)
+	calls := 0
+	c.sendFunc = func(context.Context, source.SendRequest) (*source.SendResult, error) {
+		calls++
+		return nil, errors.New("lost transport")
+	}
+	if _, err := c.HandleMatrixMessage(ctx, msg); err == nil {
+		t.Fatal("uncertain send reported success")
+	}
+	c.sendFunc = func(context.Context, source.SendRequest) (*source.SendResult, error) {
+		calls++
+		return &source.SendResult{Version: 1, Status: "accepted", UserMessageID: "33333333-3333-3333-3333-333333333333"}, nil
+	}
+	beforeRooms, beforeMessages := mx.rooms, mx.messages
+	chat.Unchanged = true
+	if err := c.dispatchConversation(ctx, chat); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := c.getOutbound(ctx, msg.Portal)
+	if err != nil || pending != nil {
+		t.Fatalf("unchanged recovery remains pending: %v", err)
+	}
+	if calls != 2 || mx.rooms != beforeRooms || mx.messages != beforeMessages {
+		t.Fatalf("calls=%d rooms=%d messages=%d", calls, mx.rooms, mx.messages)
+	}
+}
+
 func TestOversizedCodexRolloutProducesActionableFailure(t *testing.T) {
 	got := rejectedSendMessage("codex_rollout_unavailable")
 	want := "This Codex task is too large to bridge safely. Nothing was submitted; open the original task in the desktop app."

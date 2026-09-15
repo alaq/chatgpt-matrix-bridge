@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
+import re
 from datetime import datetime
 
 
@@ -28,6 +29,34 @@ def digest(data):
 
 def timestamp(raw):
     return datetime.fromisoformat(raw.replace('Z', '+00:00')).timestamp()
+
+
+def parse_known_fingerprints(values):
+    result = {}
+    for value in values:
+        cid, separator, fingerprint = value.partition('=')
+        raw_id = cid[6:] if cid.startswith('codex:') else ''
+        try:
+            valid_id = str(uuid.UUID(raw_id)) == raw_id
+        except ValueError:
+            valid_id = False
+        if not separator or not valid_id or not re.fullmatch('[a-f0-9]{64}', fingerprint) or cid in result:
+            raise ValueError('invalid known conversation fingerprint')
+        result[cid] = fingerprint
+    return result
+
+
+def rollout_delivery_fingerprint(root, row):
+    root = root.resolve()
+    path = Path(row['rollout_path']).resolve()
+    if not path.is_relative_to(root / 'sessions') and not path.is_relative_to(root / 'archived_sessions'):
+        raise ValueError('rollout outside task store')
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise UnavailableRollout('unavailable rollout')
+    metadata = [row[key] for key in ('id', 'history_mode', 'name', 'title', 'created_at', 'updated_at')]
+    return digest(['codex-rollout-delivery-v1', *metadata, info.st_dev, info.st_ino,
+                   info.st_size, info.st_mtime_ns, info.st_ctime_ns])
 
 
 def catalog(root):
@@ -238,7 +267,7 @@ def connect_owner(root, conversation_id):
     raise DesktopRequestError('no-client-found')
 
 
-def feed(root, since, max_conversations=10, allowed_conversations=None):
+def feed(root, since, max_conversations=10, allowed_conversations=None, known_fingerprints=None):
     if not isinstance(max_conversations, int) or isinstance(max_conversations, bool) or not 1 <= max_conversations <= 100:
         raise ValueError('max conversations must be between 1 and 100')
     allowed = [item[6:] for item in (allowed_conversations or []) if isinstance(item, str) and item.startswith('codex:')]
@@ -255,6 +284,18 @@ def feed(root, since, max_conversations=10, allowed_conversations=None):
         db.close()
     conversations = []
     for row in rows:
+        fingerprint = rollout_delivery_fingerprint(root, row)
+        if (known_fingerprints or {}).get('codex:' + row['id']) == fingerprint:
+            info = Path(row['rollout_path']).resolve().stat()
+            if rollout_delivery_fingerprint(root, row) == fingerprint:
+                stale = time.time() - info.st_mtime >= 300
+                conversations.append({'id': 'codex:' + row['id'], 'kind': 'codex',
+                    'title': row['name'] or row['title'] or 'Untitled task',
+                    'url': 'codex://threads/' + row['id'], 'created_at': row['created_at'],
+                    'updated_at': row['updated_at'], 'messages': [],
+                    'running': False, 'running_known': stale,
+                    'delivery_fingerprint': fingerprint, 'unchanged': True})
+                continue
         try:
             messages, active = read_thread(root, row)
         except OversizedRollout:
@@ -263,9 +304,12 @@ def feed(root, since, max_conversations=10, allowed_conversations=None):
             # explicitly, and do not ingest bytes beyond the safety bound.
             messages, active = [], False
         public = [{k: v for k, v in m.items() if k != 'client_id'} for m in messages]
+        if rollout_delivery_fingerprint(root, row) != fingerprint:
+            fingerprint = ''
         conversations.append({'id': 'codex:' + row['id'], 'kind': 'codex', 'title': row['name'] or row['title'] or 'Untitled task',
             'revision': digest([public, active]), 'url': 'codex://threads/' + row['id'], 'created_at': row['created_at'],
-            'updated_at': row['updated_at'], 'messages': public, 'running': active})
+            'updated_at': row['updated_at'], 'messages': public, 'running': active,
+            'delivery_fingerprint': fingerprint})
     return conversations
 
 
@@ -453,6 +497,7 @@ if __name__ == '__main__':
     parser.add_argument('--since', type=float, default=0)
     parser.add_argument('--max-conversations', type=int, default=10)
     parser.add_argument('--allow-conversation', action='append', default=[])
+    parser.add_argument('--known-conversation', action='append', default=[])
     parser.add_argument('--journal')
     parser.add_argument('--conversation-id')
     parser.add_argument('operation', choices=['feed', 'send', 'probe', 'reconnect'])
@@ -460,7 +505,8 @@ if __name__ == '__main__':
     try:
         root = Path(args.codex_home).expanduser().resolve()
         if args.operation == 'feed':
-            result = feed(root, args.since, args.max_conversations, args.allow_conversation)
+            result = feed(root, args.since, args.max_conversations, args.allow_conversation,
+                          parse_known_fingerprints(args.known_conversation))
         elif args.operation in ('probe', 'reconnect'):
             result = probe(root, args.conversation_id, reconnect=args.operation == 'reconnect')
         else:

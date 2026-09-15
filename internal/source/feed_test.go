@@ -80,7 +80,7 @@ func TestBackendUsesArgumentsNotShellAndSuppressesSensitiveErrors(t *testing.T) 
 	secret := "private-token-do-not-log"
 	os.WriteFile(path, []byte("import sys\nsys.stderr.write('"+secret+"')\nsys.exit(1)\n"), 0600)
 	b := Backend{Python: "python3", Directory: dir, Archive: filepath.Join(dir, "archive; not-a-command")}
-	_, err := b.Read(context.Background())
+	_, err := b.Read(context.Background(), nil)
 	if err == nil || strings.Contains(err.Error(), secret) {
 		t.Fatal("sensitive backend error surfaced")
 	}
@@ -91,17 +91,31 @@ func TestBackendContractRoundTripAndCancellation(t *testing.T) {
 	os.MkdirAll(scripts, 0700)
 	raw, _ := json.Marshal(sample())
 	path := filepath.Join(scripts, "cli.py")
-	os.WriteFile(path, []byte("import sys\nassert sys.argv[-4:] == ['--max-conversations', '10', '--allow-conversation', 'allowed']\nprint("+string(mustJSON(string(raw)))+")\n"), 0600)
+	os.WriteFile(path, []byte("import sys\nassert sys.argv[-6:] == ['--max-conversations', '10', '--allow-conversation', 'allowed', '--known-conversation', '11111111-1111-1111-1111-111111111111="+strings.Repeat("e", 64)+"']\nprint("+string(mustJSON(string(raw)))+")\n"), 0600)
 	b := Backend{Python: "python3", Directory: dir, Archive: dir, MaxConversations: 10, AllowConversations: []string{"allowed"}}
-	s, err := b.Read(context.Background())
+	s, err := b.Read(context.Background(), map[string]Conversation{"11111111-1111-1111-1111-111111111111": {DeliveryFingerprint: strings.Repeat("e", 64)}})
 	if err != nil || len(s.Conversations) != 1 {
 		t.Fatalf("contract: %v", err)
 	}
 	os.WriteFile(path, []byte("import time\ntime.sleep(30)\n"), 0600)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, err = b.Read(ctx); err == nil {
+	if _, err = b.Read(ctx, nil); err == nil {
 		t.Fatal("cancellation ignored")
+	}
+}
+
+func TestUnchangedConversationRequiresAndHydratesVerifiedDeliveryState(t *testing.T) {
+	id := "11111111-1111-1111-1111-111111111111"
+	fingerprint := strings.Repeat("e", 64)
+	s := &Snapshot{Version: 1, Source: "chatgpt", AccountKey: strings.Repeat("a", 64), Conversations: []Conversation{{ID: id, Unchanged: true, DeliveryFingerprint: fingerprint}}}
+	known := map[string]Conversation{id: {ID: id, Revision: strings.Repeat("b", 64), Title: "Question", URL: "https://chatgpt.com/c/" + id, CreatedAt: 100, UpdatedAt: 200, Messages: []Message{{ID: "m1", Role: "user", Text: "Question"}}, DeliveryFingerprint: fingerprint}}
+	if err := HydrateUnchanged(s, known); err != nil || !s.Conversations[0].Unchanged || s.Conversations[0].Title != "Question" || len(s.Conversations[0].Messages) != 1 {
+		t.Fatalf("unchanged hydration failed: %+v %v", s.Conversations[0], err)
+	}
+	s.Conversations[0] = Conversation{ID: id, Unchanged: true, DeliveryFingerprint: strings.Repeat("f", 64)}
+	if err := HydrateUnchanged(s, known); err == nil {
+		t.Fatal("mismatched fingerprint accepted")
 	}
 }
 func mustJSON(v any) []byte {

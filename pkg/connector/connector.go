@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -189,9 +190,13 @@ func (c *Client) poll(ctx context.Context) (result error) {
 
 func (c *Client) deliverArchive(ctx context.Context) error {
 	meta := c.login.Metadata.(*LoginMetadata)
+	known, err := c.loadDelivered(ctx)
+	if err != nil {
+		return err
+	}
 	var chats []source.Conversation
 	var failures []error
-	snapshot, err := c.backend.Read(ctx)
+	snapshot, err := c.backend.Read(ctx, known)
 	if err == nil {
 		chats, err = source.Select(snapshot, meta.AccountKey, meta.Since)
 	}
@@ -214,7 +219,7 @@ func (c *Client) deliverArchive(ctx context.Context) error {
 		}
 		if err == nil {
 			var tasks []source.Conversation
-			tasks, err = local.Read(ctx, meta.AccountKey)
+			tasks, err = local.Read(ctx, meta.AccountKey, known)
 			chats = append(chats, tasks...)
 		}
 		if err != nil {
@@ -232,11 +237,81 @@ func (c *Client) deliverArchive(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := c.dispatch(ctx, chat); err != nil {
+		if err := c.dispatchConversation(ctx, chat); err != nil {
 			failures = append(failures, err)
 		}
 	}
 	return errors.Join(failures...)
+}
+
+const deliveryStatePrefix = "chatgpt_delivery_v1_"
+
+func (c *Client) loadDelivered(ctx context.Context) (map[string]source.Conversation, error) {
+	rows, err := c.connector.br.DB.Query(ctx, "SELECT key,value FROM kv_store WHERE bridge_id=$1 AND key LIKE $2", c.connector.br.ID, deliveryStatePrefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[string]source.Conversation{}
+	account := c.login.Metadata.(*LoginMetadata).AccountKey
+	for rows.Next() {
+		var key, raw string
+		var chat source.Conversation
+		if err := rows.Scan(&key, &raw); err != nil {
+			return nil, err
+		}
+		if json.Unmarshal([]byte(raw), &chat) != nil || chat.Unchanged || len(chat.Messages) != 0 {
+			continue
+		}
+		check := source.Snapshot{Version: 1, Source: "chatgpt", AccountKey: account, Conversations: []source.Conversation{chat}}
+		expectedKey := deliveryStatePrefix + source.PortalID(account, chat.ID)
+		if key != expectedKey || check.Validate() != nil || len(chat.DeliveryFingerprint) != 64 {
+			continue
+		}
+		result[chat.ID] = chat
+	}
+	return result, rows.Err()
+}
+
+func (c *Client) saveDelivered(ctx context.Context, chat source.Conversation) error {
+	if chat.DeliveryFingerprint == "" {
+		return nil
+	}
+	chat.Messages = nil
+	chat.Unchanged = false
+	chat.RunningKnown = false
+	check := source.Snapshot{Version: 1, Source: "chatgpt", AccountKey: c.login.Metadata.(*LoginMetadata).AccountKey, Conversations: []source.Conversation{chat}}
+	if err := check.Validate(); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(chat)
+	if err != nil {
+		return err
+	}
+	key := deliveryStatePrefix + source.PortalID(c.login.Metadata.(*LoginMetadata).AccountKey, chat.ID)
+	_, err = c.connector.br.DB.Exec(ctx, "INSERT INTO kv_store (bridge_id,key,value) VALUES ($1,$2,$3) ON CONFLICT (bridge_id,key) DO UPDATE SET value=excluded.value", c.connector.br.ID, key, string(raw))
+	return err
+}
+
+func (c *Client) dispatchConversation(ctx context.Context, chat source.Conversation) error {
+	if chat.Unchanged {
+		account := c.login.Metadata.(*LoginMetadata).AccountKey
+		key := networkid.PortalKey{ID: networkid.PortalID(source.PortalID(account, chat.ID)), Receiver: c.login.ID}
+		portal, err := c.connector.br.GetPortalByKey(ctx, key)
+		if err != nil {
+			return err
+		}
+		if portal != nil {
+			if err := c.recoverOutbound(ctx, portal); err != nil {
+				return err
+			}
+		}
+		if chat.Kind == "codex" || chat.Kind == "work" || chat.Running {
+			c.observeTaskState(ctx, chat)
+		}
+		return nil
+	}
+	return c.dispatch(ctx, chat)
 }
 
 func (c *Client) replaceActiveCache(account string, chats []source.Conversation) {
@@ -319,6 +394,11 @@ func (c *Client) dispatch(ctx context.Context, chat source.Conversation) error {
 	}
 	if branchKey != "" {
 		if err := c.saveBranch(ctx, branchKey, branchData); err != nil {
+			return err
+		}
+	}
+	if len(mediaFailures) == 0 {
+		if err := c.saveDelivered(ctx, chat); err != nil {
 			return err
 		}
 	}

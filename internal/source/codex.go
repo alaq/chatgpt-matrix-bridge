@@ -8,6 +8,7 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -32,7 +33,7 @@ func (b LocalTasks) Validate() error {
 	}
 	return nil
 }
-func (b LocalTasks) run(ctx context.Context, op string, request *SendRequest) ([]byte, error) {
+func (b LocalTasks) run(ctx context.Context, op string, request *SendRequest, known map[string]Conversation) ([]byte, error) {
 	if !b.Enabled() {
 		return nil, errors.New("local tasks are disabled")
 	}
@@ -49,6 +50,16 @@ func (b LocalTasks) run(ctx context.Context, op string, request *SendRequest) ([
 	for _, id := range b.AllowConversations {
 		argv = append(argv, "--allow-conversation", id)
 	}
+	ids := make([]string, 0, len(known))
+	for id, chat := range known {
+		if strings.HasPrefix(id, "codex:") && accountPattern.MatchString(chat.DeliveryFingerprint) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		argv = append(argv, "--known-conversation", id+"="+known[id].DeliveryFingerprint)
+	}
 	argv = append(argv, op)
 	cmd := exec.CommandContext(ctx, b.Python, argv...)
 	if request != nil {
@@ -63,8 +74,8 @@ func (b LocalTasks) run(ctx context.Context, op string, request *SendRequest) ([
 	}
 	return out.Bytes(), nil
 }
-func (b LocalTasks) Read(ctx context.Context, account string) ([]Conversation, error) {
-	data, err := b.run(ctx, "feed", nil)
+func (b LocalTasks) Read(ctx context.Context, account string, known map[string]Conversation) ([]Conversation, error) {
+	data, err := b.run(ctx, "feed", nil, known)
 	if err != nil {
 		return nil, err
 	}
@@ -78,6 +89,9 @@ func (b LocalTasks) Read(ctx context.Context, account string) ([]Conversation, e
 		}
 	}
 	s := Snapshot{Version: 1, Source: "chatgpt", AccountKey: account, Conversations: chats}
+	if err := HydrateUnchanged(&s, known); err != nil {
+		return nil, err
+	}
 	return Select(&s, account, b.Since)
 }
 func (b LocalTasks) Send(ctx context.Context, request SendRequest) (*SendResult, error) {
@@ -87,7 +101,7 @@ func (b LocalTasks) Send(ctx context.Context, request SendRequest) (*SendResult,
 	if !strings.HasPrefix(request.ConversationID, "codex:") || len(request.Attachments) > 0 {
 		return nil, errors.New("local tasks support text replies only")
 	}
-	data, err := b.run(ctx, "send", &request)
+	data, err := b.run(ctx, "send", &request, nil)
 	if err != nil {
 		return nil, err
 	}

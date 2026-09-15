@@ -9,7 +9,7 @@ from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from unittest.mock import patch
-from codex_source import feed, read_thread, send, probe, DesktopIPC, DesktopRequestError, UnavailableRollout, OversizedRollout, open_original_task
+from codex_source import feed, read_thread, send, probe, DesktopIPC, DesktopRequestError, UnavailableRollout, OversizedRollout, open_original_task, rollout_delivery_fingerprint
 
 class CodexTests(unittest.TestCase):
     def test_only_completed_visible_items_and_stable_identity(self):
@@ -65,6 +65,23 @@ class CodexTests(unittest.TestCase):
             self.assertEqual([chat['id'] for chat in result], [f'codex:{index}' for index in range(2,12)])
             allowed=feed(root,0,10,['codex:0'])
             self.assertEqual([chat['id'] for chat in allowed], ['codex:0'])
+
+    def test_known_fingerprint_skips_rollout_open(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'sessions').mkdir()
+            path=root/'sessions/thread.jsonl';path.write_text('{malformed')
+            row=('thread',str(path),'paginated',0,'cli','Task',None,1,2)
+            with closing(sqlite3.connect(root/'state_1.sqlite')) as db:
+                db.execute('CREATE TABLE threads (id TEXT, rollout_path TEXT, history_mode TEXT, archived INTEGER, source TEXT, name TEXT, title TEXT, created_at REAL, updated_at REAL)')
+                db.execute('INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?)',row);db.commit()
+                db.row_factory=sqlite3.Row
+                record=db.execute('SELECT * FROM threads').fetchone()
+                fingerprint=rollout_delivery_fingerprint(root,record)
+            result=feed(root,0,known_fingerprints={'codex:thread':fingerprint})
+            self.assertEqual(result,[{'id':'codex:thread','kind':'codex','title':'Task',
+                'url':'codex://threads/thread','created_at':1,'updated_at':2,'messages':[],
+                'running':False,'running_known':False,
+                'delivery_fingerprint':fingerprint,'unchanged':True}])
 
     def test_read_thread_rejects_growth_beyond_safety_bound_after_open(self):
         with tempfile.TemporaryDirectory() as d:

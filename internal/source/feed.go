@@ -46,15 +46,18 @@ type CitationGroup struct {
 }
 
 type Conversation struct {
-	Kind      string    `json:"kind,omitempty"`
-	Running   bool      `json:"running,omitempty"`
-	ID        string    `json:"id"`
-	Revision  string    `json:"revision"`
-	Title     string    `json:"title"`
-	URL       string    `json:"url"`
-	CreatedAt float64   `json:"created_at"`
-	UpdatedAt float64   `json:"updated_at"`
-	Messages  []Message `json:"messages"`
+	Kind                string    `json:"kind,omitempty"`
+	Running             bool      `json:"running,omitempty"`
+	RunningKnown        bool      `json:"running_known,omitempty"`
+	Unchanged           bool      `json:"unchanged,omitempty"`
+	ID                  string    `json:"id"`
+	Revision            string    `json:"revision"`
+	DeliveryFingerprint string    `json:"delivery_fingerprint,omitempty"`
+	Title               string    `json:"title"`
+	URL                 string    `json:"url"`
+	CreatedAt           float64   `json:"created_at"`
+	UpdatedAt           float64   `json:"updated_at"`
+	Messages            []Message `json:"messages"`
 }
 
 type Snapshot struct {
@@ -88,11 +91,19 @@ func (s *Snapshot) Validate() error {
 	}
 	seen := map[string]bool{}
 	for _, c := range s.Conversations {
+		if c.Unchanged {
+			validStubID := idPattern.MatchString(c.ID) || strings.HasPrefix(c.ID, "codex:") && idPattern.MatchString(strings.TrimPrefix(c.ID, "codex:"))
+			if !validStubID || seen[c.ID] || !accountPattern.MatchString(c.DeliveryFingerprint) || len(c.Messages) != 0 {
+				return errors.New("invalid unchanged conversation")
+			}
+			seen[c.ID] = true
+			continue
+		}
 		validID := idPattern.MatchString(c.ID) && c.URL == "https://chatgpt.com/c/"+c.ID && (c.Kind == "" || c.Kind == "chatgpt" || c.Kind == "work")
 		if c.Kind == "codex" {
 			validID = strings.HasPrefix(c.ID, "codex:") && idPattern.MatchString(strings.TrimPrefix(c.ID, "codex:")) && c.URL == "codex://threads/"+strings.TrimPrefix(c.ID, "codex:")
 		}
-		if !validID || seen[c.ID] || !accountPattern.MatchString(c.Revision) || !finite(c.CreatedAt) || !finite(c.UpdatedAt) {
+		if !validID || seen[c.ID] || !accountPattern.MatchString(c.Revision) || c.DeliveryFingerprint != "" && !accountPattern.MatchString(c.DeliveryFingerprint) || !finite(c.CreatedAt) || !finite(c.UpdatedAt) {
 			return errors.New("invalid or duplicate conversation identity")
 		}
 		seen[c.ID] = true
@@ -105,6 +116,33 @@ func (s *Snapshot) Validate() error {
 		}
 	}
 	return nil
+}
+
+func HydrateUnchanged(s *Snapshot, known map[string]Conversation) error {
+	for i, stub := range s.Conversations {
+		if !stub.Unchanged {
+			continue
+		}
+		previous, ok := known[stub.ID]
+		if !ok || previous.DeliveryFingerprint != stub.DeliveryFingerprint || previous.Unchanged {
+			return errors.New("unchanged conversation has no matching delivered state")
+		}
+		previous.Unchanged = true
+		if stub.RunningKnown {
+			previous.Running = stub.Running
+		}
+		previous.RunningKnown = false
+		if stub.UpdatedAt > 0 {
+			previous.UpdatedAt = stub.UpdatedAt
+		}
+		s.Conversations[i] = previous
+	}
+	validated := *s
+	validated.Conversations = append([]Conversation(nil), s.Conversations...)
+	for i := range validated.Conversations {
+		validated.Conversations[i].Unchanged = false
+	}
+	return validated.Validate()
 }
 
 // StableID is namespaced and length-safe: no title matching or delimiter ambiguity.
@@ -198,7 +236,7 @@ func (b Backend) run(ctx context.Context, command string, args ...string) ([]byt
 	return stdout.Bytes(), nil
 }
 
-func (b Backend) Read(ctx context.Context) (*Snapshot, error) {
+func (b Backend) Read(ctx context.Context, known map[string]Conversation) (*Snapshot, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	limit := b.MaxConversations
@@ -209,11 +247,28 @@ func (b Backend) Read(ctx context.Context) (*Snapshot, error) {
 	for _, id := range b.AllowConversations {
 		args = append(args, "--allow-conversation", id)
 	}
+	ids := make([]string, 0, len(known))
+	for id, chat := range known {
+		if !strings.HasPrefix(id, "codex:") && idPattern.MatchString(id) && accountPattern.MatchString(chat.DeliveryFingerprint) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		args = append(args, "--known-conversation", id+"="+known[id].DeliveryFingerprint)
+	}
 	data, err := b.run(ctx, "feed", args...)
 	if err != nil {
 		return nil, err
 	}
-	return Decode(data)
+	snapshot, err := Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := HydrateUnchanged(snapshot, known); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
 }
 
 func (b Backend) Refresh(ctx context.Context) error {
