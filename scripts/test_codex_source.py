@@ -3,11 +3,12 @@ from pathlib import Path
 import tempfile
 import unittest
 import sqlite3
+import subprocess
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from unittest.mock import patch
-from codex_source import read_thread, send, probe, DesktopIPC, DesktopRequestError
+from codex_source import read_thread, send, probe, DesktopIPC, DesktopRequestError, open_original_task
 
 class CodexTests(unittest.TestCase):
     def test_only_completed_visible_items_and_stable_identity(self):
@@ -54,15 +55,25 @@ class SendTests(unittest.TestCase):
         self.no_owner = False
         self.append_receipt = True
         self.inactive_rejection = False
+        self.activation_ids = []
+        self.restore_owner = True
+        self.lookup_error = None
+        self.on_activate = None
+        self.connections = []
         outer = self
         class Owner:
-            def __init__(self, root):
+            def __init__(self, root, timeout=20):
                 outer.assertEqual(root, outer.root)
-            def close(self): pass
-            def call(self, method, params, version=1, target=None):
+                self.closed = False
+                outer.connections.append(self)
+            def close(self): self.closed = True
+            def call(self, method, params, version=1, target=None, timeout=20):
                 if method == 'thread-owner-discovery':
                     outer.assertEqual(params, {'hostId': 'local', 'conversationId': outer.cid})
-                    if outer.no_owner: raise ValueError('no-client-found')
+                    if outer.lookup_error:
+                        error, outer.lookup_error = outer.lookup_error, None
+                        raise error
+                    if outer.no_owner: raise DesktopRequestError('no-client-found')
                     return {'handledByClientId': 'original-owner'}
                 outer.assertEqual(target, 'original-owner')
                 outer.calls.append((method, params, version))
@@ -82,6 +93,13 @@ class SendTests(unittest.TestCase):
         self.patcher = patch('codex_source.DesktopIPC', Owner)
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
+        def activate(conversation_id):
+            self.activation_ids.append(conversation_id)
+            if self.on_activate: self.on_activate()
+            if self.restore_owner: self.no_owner = False
+        activation = patch('codex_source.open_original_task', side_effect=activate)
+        self.activation = activation.start()
+        self.addCleanup(activation.stop)
 
     def record(self, payload, when=None):
         with self.rollout.open('a') as f:
@@ -99,6 +117,7 @@ class SendTests(unittest.TestCase):
         self.assertEqual(params['turnStart']['request']['input'][0]['text'],self.req['text'])
         self.assertEqual(send(self.root,self.journal,self.req),result)
         self.assertEqual(len(self.calls),1)
+        self.assertEqual(self.activation_ids, [])
 
     def test_active_turn_is_steered_even_after_long_silence(self):
         self.record({'type':'task_started','turn_id':'active-turn'},'2026-09-01T00:00:00Z')
@@ -155,12 +174,105 @@ class SendTests(unittest.TestCase):
 
     def test_missing_owner_is_not_submitted_and_probe_has_no_side_effect(self):
         self.no_owner = True
-        result=send(self.root,self.journal,self.req)
+        self.restore_owner = False
+        self.assertFalse(probe(self.root,self.cid)['available'])
+        self.assertEqual(self.activation_ids, [])
+        with patch('codex_source.OWNER_RECOVERY_TIMEOUT', 0.01):
+            result=send(self.root,self.journal,self.req)
         self.assertEqual(result, {'version':1,'status':'not_sent','error':'codex_owner_unavailable'})
         self.assertEqual(list(self.journal.glob('*.json')),[])
-        self.assertFalse(probe(self.root,self.cid)['available'])
+        self.assertEqual(self.activation_ids, [self.cid])
+        self.assertTrue(all(c.closed for c in self.connections))
         self.assertEqual(self.calls,[])
         self.assertEqual(self.rollout.read_text(),'')
+
+    def test_missing_owner_opens_original_task_and_submits_same_transaction_once(self):
+        self.no_owner = True
+        result = send(self.root, self.journal, self.req)
+        self.assertEqual(result['status'], 'accepted')
+        self.assertEqual(self.activation_ids, [self.cid])
+        self.assertEqual(len(self.connections), 2)
+        self.assertTrue(all(c.closed for c in self.connections))
+        method, params, version = self.calls[0]
+        self.assertEqual((method, version), ('thread-follower-start-turn', 2))
+        self.assertEqual(params['turnStart']['context'], {'inheritThreadSettings': True})
+        request = params['turnStart']['request']
+        self.assertEqual(request['clientUserMessageId'], 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
+        self.assertEqual(request['threadId'], self.cid)
+        self.assertEqual(request['input'][0]['text'], self.req['text'])
+        self.no_owner = True
+        self.assertEqual(send(self.root, self.journal, self.req), result)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.activation_ids, [self.cid])
+
+    def test_recovery_refreshes_active_state_before_choosing_steer(self):
+        self.no_owner = True
+        self.on_activate = lambda: self.record({'type': 'task_started', 'turn_id': 'existing-turn'})
+        self.assertEqual(send(self.root, self.journal, self.req)['status'], 'accepted')
+        self.assertEqual([c[0] for c in self.calls], ['thread-follower-steer-turn'])
+
+    def test_task_archived_during_recovery_is_not_submitted(self):
+        self.no_owner = True
+        def archive():
+            with closing(sqlite3.connect(self.root / 'state_5.sqlite')) as db:
+                db.execute('UPDATE threads SET archived=1')
+                db.commit()
+        self.on_activate = archive
+        self.assertEqual(send(self.root, self.journal, self.req)['status'], 'not_sent')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(list(self.journal.glob('*.json')), [])
+        self.assertTrue(all(c.closed for c in self.connections))
+
+    def test_lookup_timeout_reconnects_before_submission(self):
+        self.lookup_error = TimeoutError('lookup timed out')
+        self.assertEqual(send(self.root, self.journal, self.req)['status'], 'accepted')
+        self.assertEqual(self.activation_ids, [self.cid])
+        self.assertEqual(len(self.connections), 2)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_bad_lookup_response_does_not_activate(self):
+        self.lookup_error = ValueError('desktop response method/owner mismatch')
+        self.assertEqual(send(self.root, self.journal, self.req)['status'], 'not_sent')
+        self.assertEqual(self.activation_ids, [])
+        self.assertEqual(self.calls, [])
+
+    def test_missing_initial_socket_does_not_launch_another_app(self):
+        with patch('codex_source.DesktopIPC', side_effect=FileNotFoundError()):
+            self.assertEqual(send(self.root, self.journal, self.req)['status'], 'not_sent')
+        self.assertEqual(self.activation_ids, [])
+        self.assertEqual(self.calls, [])
+
+    def test_activation_failure_is_not_sent_and_original_transaction_can_retry(self):
+        self.no_owner = True
+        self.activation.side_effect = subprocess.TimeoutExpired('open', 5)
+        self.assertEqual(send(self.root, self.journal, self.req)['status'], 'not_sent')
+        self.assertEqual(list(self.journal.glob('*.json')), [])
+        self.assertEqual(self.calls, [])
+        self.no_owner = False
+        self.assertEqual(send(self.root, self.journal, self.req)['status'], 'accepted')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_reconnect_command_opens_without_submitting_and_rejects_archived_task(self):
+        self.no_owner = True
+        self.assertTrue(probe(self.root, self.cid, reconnect=True)['available'])
+        self.assertEqual(self.activation_ids, [self.cid])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.rollout.read_text(), '')
+        with closing(sqlite3.connect(self.root / 'state_5.sqlite')) as db:
+            db.execute('UPDATE threads SET archived=1')
+            db.commit()
+        self.assertFalse(probe(self.root, self.cid, reconnect=True)['available'])
+        self.assertEqual(self.activation_ids, [self.cid])
+
+    def test_recovered_owner_with_uncertain_send_is_never_reactivated_or_resent(self):
+        self.no_owner = True
+        self.lose_reply = True
+        self.append_receipt = False
+        with self.assertRaises(ConnectionError): send(self.root, self.journal, self.req)
+        self.no_owner = True
+        self.assertEqual(send(self.root, self.journal, self.req)['status'], 'uncertain')
+        self.assertEqual(self.activation_ids, [self.cid])
+        self.assertEqual(len(self.calls), 1)
 
     def test_transaction_payload_change_is_rejected(self):
         send(self.root,self.journal,self.req)
@@ -168,10 +280,28 @@ class SendTests(unittest.TestCase):
         self.assertEqual(len(self.calls),1)
 
     def test_concurrent_duplicate_calls_submit_once(self):
+        self.no_owner = True
         with ThreadPoolExecutor(max_workers=2) as pool:
             results=list(pool.map(lambda _:send(self.root,self.journal,self.req),range(2)))
         self.assertEqual(results[0],results[1])
         self.assertEqual(len(self.calls),1)
+        self.assertEqual(self.activation_ids, [self.cid])
+
+class ActivationTests(unittest.TestCase):
+    def test_only_valid_original_uuid_is_opened_in_the_codex_bundle_without_prompt(self):
+        cid = '11111111-1111-4111-8111-111111111111'
+        with patch('codex_source.sys.platform', 'darwin'), patch('codex_source.subprocess.run') as run:
+            open_original_task(cid)
+            run.assert_called_once_with(['/usr/bin/open', '-g', '-b', 'com.openai.codex',
+                                         'codex://threads/' + cid], check=True,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            run.reset_mock()
+            for invalid in ['new?prompt=hello', cid + '?prompt=hello', '../' + cid]:
+                with self.assertRaises(ValueError): open_original_task(invalid)
+            run.assert_not_called()
+        with patch('codex_source.sys.platform', 'linux'), patch('codex_source.subprocess.run') as run:
+            with self.assertRaises(ValueError): open_original_task(cid)
+            run.assert_not_called()
 
 class IPCResponseTests(unittest.TestCase):
     def test_different_owner_response_is_rejected(self):

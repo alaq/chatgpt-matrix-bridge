@@ -198,7 +198,11 @@ ChatGPT UUID and use `ChatGPT Work · …` titles when the source marks them `tp
 Local task replies default to read-only. The experimental `codex_send_enabled`
 option requires a verified owner-routing endpoint in the running desktop app. It
 never launches a replacement agent or changes the task's model/permissions.
-If the installed app cannot expose the original task owner, continue in that app.
+On macOS, an unavailable task owner triggers one automatic open of the exact
+original task in the running Codex app, followed by up to 12 seconds of owner
+reconnection. Submission then uses the original message transaction. The app may
+select that task in its window. If recovery fails, the reply remains explicitly
+not sent; continue in the app or retry the original message after restoring it.
 Remote-host tasks, cloud Codex-only jobs, tool traces and local artifacts are not
 part of this first discovery pilot.
 

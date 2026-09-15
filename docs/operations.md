@@ -84,16 +84,35 @@ python3 scripts/codex_source.py --codex-home "$HOME/.codex" --conversation-id <t
 ```
 
 `available: true` means the running desktop app answered the task-owner lookup.
-It is a readiness check, not proof of a completed live send. A missing owner keeps
-the room read-only until the installed app's connection is verified. The official
+It is a readiness check, not proof of a completed live send. `probe` remains
+read-only and does not activate a task. The official
 app-server continuation methods require a connection to the original server;
 starting another server over the same task store does not establish that connection.
 
-An idle task may have no registered owner even while the app is running. Opening
-that original task in the desktop app can restore its owner; probe again before
-retrying the original message. This does not remove the desktop availability
-requirement. Recovery must preserve the original event, client transaction and
-exact text, rather than posting a replacement message.
+An idle task may have no registered owner even while the app is running. On macOS,
+the sender automatically opens that original task once through
+`/usr/bin/open -g -b com.openai.codex codex://threads/<UUID>`, then reconnects to
+the desktop socket and waits up to 12 seconds for its owner. Individual connection
+and discovery attempts use at most three seconds; the OS open call uses at most
+five. The initial trusted socket must already connect. If the app is closed,
+unsupported or still cannot expose the owner, the existing not-sent notice remains.
+
+Activation contains only a validated existing task UUID, never message text,
+model/permission overrides or a new-task request. `-g` requests background opening,
+but Codex can change its selected task. The catalog and unfinished-turn state are
+read again before submission. The existing task lock, original Matrix event,
+client transaction, exact text and uncertain-send reconciliation remain in force.
+An uncertain or already accepted submission never triggers activation or resubmission.
+
+For an explicit operational readiness check that may open the existing task but
+does not submit a message:
+
+```sh
+python3 scripts/codex_source.py --codex-home "$HOME/.codex" --conversation-id <task-uuid> reconnect
+```
+
+Reconnection is part of each new send and original-transaction retry; it does not
+automatically replay previously rejected events that have already left the outbox.
 
 The sender starts an idle task through its existing owner and steers an unfinished
 turn through that same owner. It supplies no model, effort, permission or workspace

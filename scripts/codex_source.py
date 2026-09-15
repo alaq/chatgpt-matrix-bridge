@@ -15,6 +15,7 @@ import socket
 import sqlite3
 import stat
 import struct
+import subprocess
 import sys
 import time
 import uuid
@@ -96,17 +97,17 @@ class DesktopRequestError(ValueError):
 
 
 class DesktopIPC:
-    def __init__(self, root):
+    def __init__(self, root, timeout=20):
         path = root / 'ipc/ipc.sock'
         info = path.lstat()
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise ValueError('unsafe desktop socket')
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(20)
+        self.sock.settimeout(timeout)
         self.client_id = None
         try:
             self.sock.connect(str(path))
-            response = self.call('initialize', {'clientType': 'chatgpt-matrix-bridge'}, 0)
+            response = self.call('initialize', {'clientType': 'chatgpt-matrix-bridge'}, 0, timeout=timeout)
             self.client_id = response['result']['clientId']
         except Exception:
             self.sock.close()
@@ -125,14 +126,14 @@ class DesktopIPC:
             parts.extend(chunk)
         return bytes(parts)
 
-    def call(self, method, params, version=1, target=None):
+    def call(self, method, params, version=1, target=None, timeout=20):
         request_id = str(uuid.uuid4())
         request = {'type': 'request', 'requestId': request_id, 'sourceClientId': self.client_id,
-            'method': method, 'params': params, 'version': version, 'timeoutMs': 15000}
+            'method': method, 'params': params, 'version': version, 'timeoutMs': min(15000, max(1, int(timeout * 1000)))}
         if target:
             request['targetClientId'] = target
         self.write(request)
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self.sock.settimeout(max(0.01, deadline - time.monotonic()))
             size = struct.unpack('<I', self.read(4))[0]
@@ -153,6 +154,63 @@ class DesktopIPC:
 
     def close(self):
         self.sock.close()
+
+
+OWNER_LOOKUP_TIMEOUT = 3
+OWNER_RECOVERY_TIMEOUT = 12
+
+
+def open_original_task(conversation_id):
+    """Open only the existing UUID, without a prompt or a replacement executor."""
+    if str(uuid.UUID(conversation_id)) != conversation_id or sys.platform != 'darwin':
+        raise ValueError('desktop task activation unavailable')
+    # Explicit bundle identity avoids the browser/default URL handler. -g asks
+    # macOS to leave the foreground app alone; Codex may change its selected task.
+    subprocess.run(['/usr/bin/open', '-g', '-b', 'com.openai.codex',
+                    'codex://threads/' + conversation_id],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+
+
+def owner_unavailable(error):
+    return isinstance(error, OSError) or (
+        isinstance(error, DesktopRequestError) and error.error == 'no-client-found')
+
+
+def connect_owner(root, conversation_id):
+    """Find an owner, or open this task once and await its owner within a bound.
+
+    The initial trusted socket must already connect: this does not launch an app
+    in a different store or substitute a CLI when the desktop is unavailable.
+    No turn is submitted here. Caller owns the returned connection.
+    """
+    params = {'hostId': 'local', 'conversationId': conversation_id}
+    ipc = DesktopIPC(root, timeout=OWNER_LOOKUP_TIMEOUT)
+    try:
+        owner = ipc.call('thread-owner-discovery', params, timeout=OWNER_LOOKUP_TIMEOUT)['handledByClientId']
+        return ipc, owner
+    except Exception as error:
+        ipc.close()
+        if not owner_unavailable(error):
+            raise
+    open_original_task(conversation_id)
+    deadline = time.monotonic() + OWNER_RECOVERY_TIMEOUT
+    while time.monotonic() < deadline:
+        ipc = None
+        try:
+            ipc = DesktopIPC(root, timeout=min(OWNER_LOOKUP_TIMEOUT, deadline - time.monotonic()))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('desktop task owner recovery timed out')
+            owner = ipc.call('thread-owner-discovery', params,
+                             timeout=min(OWNER_LOOKUP_TIMEOUT, remaining))['handledByClientId']
+            return ipc, owner
+        except Exception as error:
+            if ipc is not None:
+                ipc.close()
+            if not owner_unavailable(error):
+                raise
+        time.sleep(max(0, min(0.25, deadline - time.monotonic())))
+    raise DesktopRequestError('no-client-found')
 
 
 def feed(root, since):
@@ -221,13 +279,19 @@ def send_locked(root, journal, request):
         atomic_record(file, record)
         return {'version': 1, 'status': 'accepted', 'userMessageId': record['message_id']}
     try:
-        ipc = DesktopIPC(root)
-    except (OSError, ValueError, KeyError):
+        ipc, owner = connect_owner(root, cid[6:])
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         return {'version': 1, 'status': 'not_sent', 'error': 'codex_owner_unavailable'}
     try:
-        try: owner = ipc.call('thread-owner-discovery', {'hostId': 'local', 'conversationId': cid[6:]})['handledByClientId']
-        except (ValueError, OSError):
-            return {'version':1,'status':'not_sent','error':'codex_owner_unavailable'}
+        # Activation can take several seconds. Respect an archive/handoff and
+        # use the current rollout/workspace before any submission is journaled.
+        db = catalog(root)
+        try:
+            row = db.execute('SELECT * FROM threads WHERE id=? AND archived=0', (cid[6:],)).fetchone()
+        finally:
+            db.close()
+        if row is None:
+            return {'version': 1, 'status': 'not_sent', 'error': 'codex_owner_unavailable'}
         client_id = str(uuid.UUID(transaction[:32]))
         # Refresh immediately before choosing start vs. steer. The desktop owner
         # remains responsible for an active-turn race; never fall back to a new
@@ -277,8 +341,8 @@ def turn_request(thread_id, text, client_id, cwd, active):
                 'ideContext': None, 'workspaceRoots': [cwd]}}}, 1
 
 
-def probe(root, conversation_id):
-    """Read-only readiness check; never resume, open or submit to a task."""
+def probe(root, conversation_id, reconnect=False):
+    """Read-only by default. Explicit reconnect may open, but never submit."""
     if str(uuid.UUID(conversation_id)) != conversation_id:
         raise ValueError('invalid task identity')
     db = catalog(root)
@@ -290,13 +354,18 @@ def probe(root, conversation_id):
         return {'available': False, 'reason': 'codex_task_unavailable'}
     _, active = read_thread(root, row)
     try:
-        ipc = DesktopIPC(root)
-        try:
-            response = ipc.call('thread-owner-discovery', {'hostId': 'local', 'conversationId': conversation_id})
-            ready = bool(response['handledByClientId'])
-        finally:
+        if reconnect:
+            ipc, owner = connect_owner(root, conversation_id)
             ipc.close()
-    except (OSError, ValueError, KeyError):
+            ready = bool(owner)
+        else:
+            ipc = DesktopIPC(root)
+            try:
+                response = ipc.call('thread-owner-discovery', {'hostId': 'local', 'conversationId': conversation_id})
+                ready = bool(response['handledByClientId'])
+            finally:
+                ipc.close()
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         ready = False
     return {'available': ready, 'reason': None if ready else 'codex_owner_unavailable',
         'running': active, 'conversationId': conversation_id}
@@ -323,14 +392,14 @@ if __name__ == '__main__':
     parser.add_argument('--since', type=float, default=0)
     parser.add_argument('--journal')
     parser.add_argument('--conversation-id')
-    parser.add_argument('operation', choices=['feed', 'send', 'probe'])
+    parser.add_argument('operation', choices=['feed', 'send', 'probe', 'reconnect'])
     args = parser.parse_args()
     try:
         root = Path(args.codex_home).expanduser().resolve()
         if args.operation == 'feed':
             result = feed(root, args.since)
-        elif args.operation == 'probe':
-            result = probe(root, args.conversation_id)
+        elif args.operation in ('probe', 'reconnect'):
+            result = probe(root, args.conversation_id, reconnect=args.operation == 'reconnect')
         else:
             result = send(root, Path(args.journal), json.loads(sys.stdin.buffer.read(80 * 1024)))
         print(json.dumps(result))
