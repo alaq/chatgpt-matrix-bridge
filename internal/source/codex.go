@@ -103,7 +103,7 @@ func localTaskDiagnostic(raw []byte, operation string) string {
 		return ""
 	}
 	switch diagnostic.Code {
-	case "catalog", "filesystem", "encoding", "missing_field", "record_shape", "invalid_value", "internal":
+	case "catalog", "catalog_open", "catalog_busy", "catalog_readonly", "catalog_corrupt", "filesystem", "encoding", "missing_field", "record_shape", "invalid_value", "internal":
 		return fmt.Sprintf(", code=%s line=%d errno=%d", diagnostic.Code, diagnostic.Line, diagnostic.Errno)
 	default:
 		return ""

@@ -63,9 +63,20 @@ def catalog(root):
     paths = sorted(root.glob('state_*.sqlite'), key=lambda p: int(p.stem.split('_')[1]))
     if not paths:
         raise ValueError('local task catalog unavailable')
-    db = sqlite3.connect(paths[-1].as_uri() + '?mode=ro', uri=True)
-    db.row_factory = sqlite3.Row
-    return db
+    # The last desktop connection can remove WAL/SHM files on close. On the
+    # deployed macOS SQLite, mode=ro then fails on the first SELECT. Permit
+    # SQLite's normal sidecar initialization, but prohibit SQL data/schema
+    # writes before touching the catalog. mode=rw cannot create a missing DB.
+    db = sqlite3.connect(paths[-1].as_uri() + '?mode=rw', uri=True)
+    try:
+        db.execute('PRAGMA query_only=ON')
+        if db.execute('PRAGMA query_only').fetchone()[0] != 1:
+            raise ValueError('query-only catalog unavailable')
+        db.row_factory = sqlite3.Row
+        return db
+    except Exception:
+        db.close()
+        raise
 
 
 class UnavailableRollout(ValueError):
@@ -496,6 +507,12 @@ def failure_diagnostic(error, operation):
                   (UnicodeError, 'encoding'), (KeyError, 'missing_field'),
                   (TypeError, 'record_shape'), (ValueError, 'invalid_value'))
     code = next((name for kind, name in categories if isinstance(error, kind)), 'internal')
+    if isinstance(error, sqlite3.Error):
+        code = {'unable to open database file': 'catalog_open',
+                'database is locked': 'catalog_busy',
+                'database table is locked': 'catalog_busy',
+                'attempt to write a readonly database': 'catalog_readonly',
+                'database disk image is malformed': 'catalog_corrupt'}.get(str(error), code)
     line = 0
     frame = error.__traceback__
     while frame:

@@ -69,6 +69,14 @@ or expired files keep the original-conversation fallback.
 
 ## Local tasks
 
+The catalog connection opens the existing database with `mode=rw`, then enables
+and verifies `PRAGMA query_only=ON` before any catalog query. SQLite can initialize
+its WAL/SHM companion files after the desktop's last connection closes; SQL changes
+to task data and schema remain blocked. Do not switch this live catalog to
+`immutable=1`, disable locking, or manually remove its WAL/SHM files: that would
+lose a fresh, coherent view. See SQLite's [WAL lifecycle](https://www.sqlite.org/wal.html)
+and [query-only setting](https://www.sqlite.org/pragma.html#pragma_query_only).
+
 The active polling limit does not limit where the owner can reply. Existing dormant
 rooms resolve their original source URL from the persisted portal, verified against
 its account-bound portal ID and current allowlist. A changed title or topic cannot

@@ -6,13 +6,62 @@ import unittest
 import sqlite3
 import subprocess
 import sys
+import shutil
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from unittest.mock import patch
-from codex_source import feed, read_thread, send, probe, DesktopIPC, DesktopRequestError, UnavailableRollout, OversizedRollout, open_original_task, rollout_delivery_fingerprint, failure_diagnostic
+from codex_source import catalog, feed, read_thread, send, probe, DesktopIPC, DesktopRequestError, UnavailableRollout, OversizedRollout, open_original_task, rollout_delivery_fingerprint, failure_diagnostic
 
 class CodexTests(unittest.TestCase):
+    def test_catalog_survives_idle_wal_cleanup_and_reads_latest_commits(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);path=root/'state_5.sqlite'
+            with closing(sqlite3.connect(path)) as writer:
+                self.assertEqual(writer.execute('PRAGMA journal_mode=WAL').fetchone()[0], 'wal')
+                writer.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)')
+                writer.execute("INSERT INTO threads VALUES ('task','original')");writer.commit()
+                self.assertEqual(writer.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0],0)
+            for cycle in range(3):
+                # Some SQLite builds persist sidecars. A copy of this fully
+                # checkpointed, closed fixture models their absence portably.
+                cycle_root=root/str(cycle);cycle_root.mkdir()
+                next_path=cycle_root/'state_5.sqlite';shutil.copyfile(path,next_path);path=next_path
+                self.assertFalse(Path(str(path)+'-wal').exists())
+                self.assertFalse(Path(str(path)+'-shm').exists())
+                with closing(catalog(cycle_root)) as reader:
+                    self.assertEqual(reader.execute('SELECT id FROM threads').fetchone()[0],'task')
+                    self.assertEqual(reader.execute('PRAGMA query_only').fetchone()[0],1)
+                    with closing(sqlite3.connect(path)) as writer:
+                        writer.execute('UPDATE threads SET title=?',(str(cycle),));writer.commit()
+                        # A fresh SELECT must include commits still in the live WAL.
+                        self.assertEqual(reader.execute('SELECT title FROM threads').fetchone()[0],str(cycle))
+                    for sql in ("UPDATE threads SET title='forbidden'", 'DELETE FROM threads',
+                                "INSERT INTO threads VALUES ('new','forbidden')", 'CREATE TABLE forbidden (id TEXT)'):
+                        with self.assertRaises(sqlite3.OperationalError):reader.execute(sql)
+                    self.assertEqual(reader.execute('SELECT title FROM threads').fetchone()[0],str(cycle))
+                with closing(sqlite3.connect(path)) as checkpointer:
+                    self.assertEqual(checkpointer.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0],0)
+
+    def test_catalog_query_only_failure_closes_connection(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'state_5.sqlite').touch()
+            class FailedConnection:
+                closed=False
+                def execute(self,*args):raise sqlite3.OperationalError('pragma unavailable')
+                def close(self):self.closed=True
+            connection=FailedConnection()
+            with patch('codex_source.sqlite3.connect',return_value=connection):
+                with self.assertRaises(sqlite3.OperationalError):catalog(root)
+            self.assertTrue(connection.closed)
+
+    def test_catalog_refuses_missing_database_after_discovery(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);missing=root/'state_5.sqlite'
+            with patch.object(Path,'glob',return_value=iter([missing])):
+                with self.assertRaises(sqlite3.OperationalError):catalog(root)
+            self.assertFalse(missing.exists())
+
     def test_failure_diagnostic_excludes_exception_content(self):
         private = 'private transcript and credential /secret/path'
         for error, code in ((ValueError(private), 'invalid_value'),
@@ -24,6 +73,7 @@ class CodexTests(unittest.TestCase):
             self.assertEqual(diagnostic['code'], code)
             self.assertNotIn(private, json.dumps(diagnostic))
             self.assertEqual(diagnostic['errno'], 2 if code == 'filesystem' else 0)
+        self.assertEqual(failure_diagnostic(sqlite3.OperationalError('unable to open database file'), 'feed')['code'], 'catalog_open')
 
     def test_feed_cli_reports_missing_rollout_without_exposing_path(self):
         with tempfile.TemporaryDirectory() as d:
