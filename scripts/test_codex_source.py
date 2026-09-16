@@ -5,13 +5,45 @@ import tempfile
 import unittest
 import sqlite3
 import subprocess
+import sys
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from unittest.mock import patch
-from codex_source import feed, read_thread, send, probe, DesktopIPC, DesktopRequestError, UnavailableRollout, OversizedRollout, open_original_task, rollout_delivery_fingerprint
+from codex_source import feed, read_thread, send, probe, DesktopIPC, DesktopRequestError, UnavailableRollout, OversizedRollout, open_original_task, rollout_delivery_fingerprint, failure_diagnostic
 
 class CodexTests(unittest.TestCase):
+    def test_failure_diagnostic_excludes_exception_content(self):
+        private = 'private transcript and credential /secret/path'
+        for error, code in ((ValueError(private), 'invalid_value'),
+                            (KeyError(private), 'missing_field'),
+                            (TypeError(private), 'record_shape'),
+                            (sqlite3.OperationalError(private), 'catalog'),
+                            (FileNotFoundError(2, private), 'filesystem')):
+            diagnostic = failure_diagnostic(error, 'feed')
+            self.assertEqual(diagnostic['code'], code)
+            self.assertNotIn(private, json.dumps(diagnostic))
+            self.assertEqual(diagnostic['errno'], 2 if code == 'filesystem' else 0)
+
+    def test_feed_cli_reports_missing_rollout_without_exposing_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'sessions').mkdir()
+            private_path=root/'sessions/private-transcript.jsonl'
+            with closing(sqlite3.connect(root/'state_1.sqlite')) as db:
+                db.execute('CREATE TABLE threads (id TEXT, rollout_path TEXT, history_mode TEXT, archived INTEGER, source TEXT, name TEXT, title TEXT, created_at REAL, updated_at REAL)')
+                db.execute('INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?)',
+                           ('missing',str(private_path),'paginated',0,'cli','Private title',None,1,2))
+                db.commit()
+            result=subprocess.run([sys.executable,str(Path(__file__).with_name('codex_source.py')),
+                                   '--codex-home',str(root),'feed'],capture_output=True,text=True)
+            self.assertEqual(result.returncode,1)
+            self.assertEqual(result.stdout,'')
+            diagnostic=json.loads(result.stderr)
+            self.assertEqual(diagnostic['code'],'filesystem')
+            self.assertEqual(diagnostic['errno'],2)
+            self.assertGreater(diagnostic['line'],0)
+            self.assertNotIn(str(private_path),result.stderr)
+
     def test_only_completed_visible_items_and_stable_identity(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);(root/'sessions').mkdir();path=root/'sessions/session.jsonl'

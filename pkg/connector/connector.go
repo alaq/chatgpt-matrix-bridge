@@ -182,7 +182,8 @@ func (c *Client) poll(ctx context.Context) (result error) {
 	// Finish local delivery/presentation updates, but report the refresh failure
 	// and back off instead of claiming that the source is synchronized.
 	defer func() {
-		c.recordHealth(ctx, refreshErr, errors.Join(creationErr, result))
+		sourceErr, deliveryErr := splitSyncFailures(result)
+		c.recordHealth(ctx, errors.Join(refreshErr, sourceErr), errors.Join(creationErr, deliveryErr))
 		result = errors.Join(refreshErr, creationErr, result)
 	}()
 	return c.deliverArchive(ctx)
@@ -201,7 +202,7 @@ func (c *Client) deliverArchive(ctx context.Context) error {
 		chats, err = source.Select(snapshot, meta.AccountKey, meta.Since)
 	}
 	if err != nil {
-		failures = append(failures, err)
+		failures = append(failures, sourceReadFailure{err})
 	}
 	local := c.connector.Config.LocalTasks()
 	if local.Enabled() {
@@ -223,7 +224,7 @@ func (c *Client) deliverArchive(ctx context.Context) error {
 			chats = append(chats, tasks...)
 		}
 		if err != nil {
-			failures = append(failures, err)
+			failures = append(failures, sourceReadFailure{err})
 		}
 	}
 	chats = c.connector.Config.selectActive(chats)

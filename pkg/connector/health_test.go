@@ -35,3 +35,23 @@ func TestHealthSeparatesSourceOutageFromDeliveryAndDoesNotExportContent(t *testi
 		t.Fatal("health file is not private")
 	}
 }
+
+func TestLocalReaderFailureDoesNotMisreportMatrixDelivery(t *testing.T) {
+	mx := &matrixFixture{names: map[id.RoomID]string{}}
+	root := t.TempDir()
+	br, c := startFixture(t, filepath.Join(root, "bridge.db"), mx)
+	defer br.Stop()
+	c.recordHealth(context.Background(), nil, nil)
+	previous := c.health.LastSourceSuccess
+	readerErr := errors.New("local task source unavailable")
+	sourceErr, deliveryErr := splitSyncFailures(errors.Join(sourceReadFailure{readerErr}))
+	c.recordHealth(context.Background(), sourceErr, deliveryErr)
+	if c.health.SourceAvailable || !c.health.DeliveryAvailable || !c.health.LastSourceSuccess.Equal(previous) {
+		t.Fatal("local reader failure was not classified as a source failure")
+	}
+	matrixErr := errors.New("matrix unavailable")
+	sourceErr, deliveryErr = splitSyncFailures(errors.Join(sourceReadFailure{readerErr}, matrixErr))
+	if !errors.Is(sourceErr, readerErr) || !errors.Is(deliveryErr, matrixErr) || errors.Is(deliveryErr, readerErr) {
+		t.Fatal("mixed source and delivery failures were not retained separately")
+	}
+}

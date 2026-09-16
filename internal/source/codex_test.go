@@ -49,3 +49,31 @@ print('[]')
 		t.Fatal(err)
 	}
 }
+
+func TestLocalTaskFailureReportsOnlyBoundedDiagnosticFields(t *testing.T) {
+	dir := t.TempDir()
+	adapter := filepath.Join(dir, "adapter.py")
+	script := `import sys
+sys.stderr.write('{"version":1,"operation":"feed","code":"filesystem","line":53,"errno":2,"private":"credential"}')
+sys.exit(1)
+`
+	if err := os.WriteFile(adapter, []byte(script), 0600); err != nil {
+		t.Fatal(err)
+	}
+	b := LocalTasks{Python: "python3", Adapter: adapter, Home: dir, Journal: filepath.Join(dir, "journal"), Since: 1}
+	_, err := b.Read(context.Background(), strings.Repeat("a", 64), nil)
+	if err == nil || !strings.Contains(err.Error(), "process_exit_1, code=filesystem line=53 errno=2") || strings.Contains(err.Error(), "credential") {
+		t.Fatalf("unexpected safe diagnostic: %v", err)
+	}
+	for _, raw := range []string{
+		"Traceback containing private content",
+		`{"version":1,"operation":"feed","code":"private transcript","line":53,"errno":2}`,
+		`{"version":1,"operation":"send","code":"filesystem","line":53,"errno":2}`,
+		`{"version":1,"operation":"feed","code":"filesystem","line":-1,"errno":2}`,
+		strings.Repeat("x", 4097),
+	} {
+		if diagnostic := localTaskDiagnostic([]byte(raw), "feed"); diagnostic != "" {
+			t.Fatalf("untrusted diagnostic accepted: %q", diagnostic)
+		}
+	}
+}

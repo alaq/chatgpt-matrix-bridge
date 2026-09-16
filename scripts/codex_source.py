@@ -490,6 +490,22 @@ def atomic_record(file, record):
         tmp.unlink(missing_ok=True)
 
 
+def failure_diagnostic(error, operation):
+    """Report a static category and code location, never exception/source text."""
+    categories = ((sqlite3.Error, 'catalog'), (OSError, 'filesystem'),
+                  (UnicodeError, 'encoding'), (KeyError, 'missing_field'),
+                  (TypeError, 'record_shape'), (ValueError, 'invalid_value'))
+    code = next((name for kind, name in categories if isinstance(error, kind)), 'internal')
+    line = 0
+    frame = error.__traceback__
+    while frame:
+        if frame.tb_frame.f_code.co_filename == __file__:
+            line = frame.tb_lineno
+        frame = frame.tb_next
+    return {'version': 1, 'operation': operation, 'code': code, 'line': line,
+            'errno': error.errno if isinstance(error, OSError) and isinstance(error.errno, int) else 0}
+
+
 if __name__ == '__main__':
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -512,6 +528,7 @@ if __name__ == '__main__':
         else:
             result = send(root, Path(args.journal), json.loads(sys.stdin.buffer.read(80 * 1024)))
         print(json.dumps(result))
-    except Exception:
+    except Exception as error:
+        sys.stderr.write(json.dumps(failure_diagnostic(error, args.operation)) + '\n')
         if args.operation == 'send': print('{"version":1,"status":"uncertain","error":"codex_source_unavailable"}')
-        else: sys.stderr.write('local task source unavailable\n'); sys.exit(1)
+        else: sys.exit(1)

@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,28 @@ import (
 
 	"maunium.net/go/mautrix/bridgev2/commands"
 )
+
+type sourceReadFailure struct{ error }
+
+func (e sourceReadFailure) Unwrap() error { return e.error }
+
+// Preserve independent source and delivery failures, including mixed results.
+func splitSyncFailures(err error) (sourceErr, deliveryErr error) {
+	if err == nil {
+		return nil, nil
+	}
+	if group, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, part := range group.Unwrap() {
+			s, d := splitSyncFailures(part)
+			sourceErr, deliveryErr = errors.Join(sourceErr, s), errors.Join(deliveryErr, d)
+		}
+		return
+	}
+	if source, ok := err.(sourceReadFailure); ok {
+		return source.error, nil
+	}
+	return nil, err
+}
 
 type syncHealth struct {
 	mu                  sync.Mutex
@@ -70,7 +93,7 @@ func (c *Client) healthSummary() string {
 	if h.LastAttempt.IsZero() {
 		state = "starting"
 	} else if !h.SourceAvailable {
-		state = "source unavailable; check the signed-in browser"
+		state = "source unavailable; check the browser and local task reader"
 	} else if !h.DeliveryAvailable {
 		state = "delivery needs recovery"
 	} else if time.Since(h.LastAttempt) > max(5*time.Minute, 3*time.Duration(c.connector.Config.PollSeconds)*time.Second) {

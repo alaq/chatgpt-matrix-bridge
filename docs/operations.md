@@ -133,6 +133,13 @@ and exact text in the original rollout.
 
 ## Verification
 
+Local reader errors in the bridge log include the operation, process exit or
+timeout, and a bounded static error category, adapter line number and errno when
+available. Exception messages, paths and transcript content are excluded. Source
+health includes both the saved ChatGPT reader and the local task reader; a local
+read failure no longer advances the successful source timestamp or marks Matrix
+delivery itself unavailable. Preserve these diagnostics before restarting a worker.
+
 Run Go tests with `-race -tags goolm`, Go vet/build, and Python tests in `scripts`.
 The backend has Node sender/media/creation tests and Python archive/feed tests.
 After rollout, verify fresh source identity, health timestamps, existing Matrix

@@ -5,12 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -68,11 +69,45 @@ func (b LocalTasks) run(ctx context.Context, op string, request *SendRequest, kn
 	}
 	out := &boundedBuffer{limit: MaxFeedBytes}
 	cmd.Stdout = out
-	cmd.Stderr = io.Discard
+	diagnostic := &boundedBuffer{limit: 4096}
+	cmd.Stderr = diagnostic
 	if err := cmd.Run(); err != nil {
-		return nil, errors.New("local task source unavailable")
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("local task source unavailable (%s): %w", op, ctx.Err())
+		}
+		status := "process_failed"
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			status = "process_exit_" + strconv.Itoa(exitErr.ExitCode())
+		} else if err.Error() == "source output limit exceeded" {
+			status = "output_limit"
+		}
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			status += " errno=" + strconv.Itoa(int(errno))
+		}
+		return nil, fmt.Errorf("local task source unavailable (%s, %s%s)", op, status, localTaskDiagnostic(diagnostic.Bytes(), op))
 	}
 	return out.Bytes(), nil
+}
+
+func localTaskDiagnostic(raw []byte, operation string) string {
+	var diagnostic struct {
+		Version   int    `json:"version"`
+		Operation string `json:"operation"`
+		Code      string `json:"code"`
+		Line      int    `json:"line"`
+		Errno     int    `json:"errno"`
+	}
+	if len(raw) > 4096 || json.Unmarshal(raw, &diagnostic) != nil || diagnostic.Version != 1 || diagnostic.Operation != operation || diagnostic.Line < 0 || diagnostic.Line > 10000 || diagnostic.Errno < 0 || diagnostic.Errno > 4096 {
+		return ""
+	}
+	switch diagnostic.Code {
+	case "catalog", "filesystem", "encoding", "missing_field", "record_shape", "invalid_value", "internal":
+		return fmt.Sprintf(", code=%s line=%d errno=%d", diagnostic.Code, diagnostic.Line, diagnostic.Errno)
+	default:
+		return ""
+	}
 }
 func (b LocalTasks) Read(ctx context.Context, account string, known map[string]Conversation) ([]Conversation, error) {
 	data, err := b.run(ctx, "feed", nil, known)
