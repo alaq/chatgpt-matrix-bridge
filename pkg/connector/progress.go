@@ -13,7 +13,7 @@ import (
 // is not evidence of generation, and silence/timeouts never imply completion.
 func (c *Client) observeGeneration(portal *bridgev2.Portal, conversationID string) {
 	if strings.HasPrefix(conversationID, "codex:") {
-		c.requestRefresh()
+		c.requestConversationRefresh(conversationID)
 		return
 	}
 	if c.backend.Descriptor == "" {
@@ -40,7 +40,7 @@ func (c *Client) observeGeneration(portal *bridgev2.Portal, conversationID strin
 				_ = ghost.Intent.MarkTyping(ctx, portal.MXID, bridgev2.TypingTypeText, 12*time.Second)
 			}
 			if phase == "complete" {
-				c.requestRefresh()
+				c.requestConversationRefresh(conversationID)
 				return
 			}
 			if phase == "idle" || phase == "needs_recovery" {
@@ -70,6 +70,9 @@ func (c *Client) observeTaskState(ctx context.Context, chat source.Conversation)
 	duration := time.Duration(0)
 	if chat.Running {
 		duration = time.Duration(c.connector.Config.PollSeconds+15) * time.Second
+		if conversationSource(chat.ID) == localSource {
+			duration = c.connector.Config.localPollInterval() + 15*time.Second
+		}
 	}
 	_ = ghost.Intent.MarkTyping(ctx, portal.MXID, bridgev2.TypingTypeText, duration)
 }

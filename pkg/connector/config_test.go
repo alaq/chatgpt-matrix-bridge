@@ -3,6 +3,7 @@ package connector
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/alaq/chatgpt-matrix-bridge/internal/source"
 )
@@ -68,5 +69,22 @@ func TestReplaceActiveCacheDropsDormantConversations(t *testing.T) {
 	client.replaceActiveCache(account, []source.Conversation{{ID: "new"}})
 	if len(client.chats) != 1 || client.chats[source.PortalID(account, "new")].ID != "new" {
 		t.Fatalf("active cache was not replaced: %#v", client.chats)
+	}
+}
+
+func TestLocalPollIntervalPreservesRemoteSetting(t *testing.T) {
+	c := Config{PollSeconds: 120}
+	if c.localPollInterval() != 10*time.Second {
+		t.Fatal("missing local setting changed default")
+	}
+	c.CodexPollSeconds = 5
+	if c.localPollInterval() != 5*time.Second || c.PollSeconds != 120 {
+		t.Fatal("local interval changed remote setting")
+	}
+	for _, value := range []int{-1, 3601} {
+		c.Enabled, c.CodexPollSeconds = true, value
+		if err := c.validate(); err == nil || err.Error() != "codex_poll_seconds must be between 0 (default: 10) and 3600" {
+			t.Fatalf("invalid local interval accepted: %v", err)
+		}
 	}
 }

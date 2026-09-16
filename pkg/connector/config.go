@@ -16,6 +16,7 @@ type Config struct {
 	ArchiveDir             string   `yaml:"archive_dir"`
 	Descriptor             string   `yaml:"descriptor"`
 	PollSeconds            int      `yaml:"poll_seconds"`
+	CodexPollSeconds       int      `yaml:"codex_poll_seconds"`
 	MaxActiveConversations int      `yaml:"max_active_conversations"`
 	Since                  string   `yaml:"since"`
 	AllowConversations     []string `yaml:"allow_conversations"`
@@ -60,6 +61,8 @@ sync_media: true
 # Optional attachment activation date; old messages keep their source links.
 media_since: ""
 # Optional local Work/Codex tasks. Separate activation avoids importing all history.
+# Independent local reads; does not refresh ChatGPT. Zero uses 10 seconds.
+codex_poll_seconds: 10
 codex_home: ""
 codex_adapter: ""
 codex_journal: ""
@@ -82,6 +85,9 @@ func (c Config) validate() error {
 	}
 	if c.PollSeconds < 15 || c.PollSeconds > 3600 {
 		return errors.New("poll_seconds must be between 15 and 3600")
+	}
+	if c.CodexPollSeconds < 0 || c.CodexPollSeconds > 3600 {
+		return errors.New("codex_poll_seconds must be between 0 (default: 10) and 3600")
 	}
 	if c.activeLimit() == 0 {
 		return errors.New("max_active_conversations must be between 1 and 100")
@@ -110,6 +116,7 @@ func upgradeConfig(h configupgrade.Helper) {
 		h.Copy(configupgrade.Str, k)
 	}
 	h.Copy(configupgrade.Int, "poll_seconds")
+	h.Copy(configupgrade.Int, "codex_poll_seconds")
 	h.Copy(configupgrade.Int, "max_active_conversations")
 	h.Copy(configupgrade.Bool, "send_enabled")
 	h.Copy(configupgrade.Bool, "sync_edits")
@@ -161,4 +168,11 @@ func (c Config) selectActive(chats []source.Conversation) []source.Conversation 
 		selected = selected[excess:]
 	}
 	return selected
+}
+
+func (c Config) localPollInterval() time.Duration {
+	if c.CodexPollSeconds == 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(c.CodexPollSeconds) * time.Second
 }

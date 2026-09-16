@@ -47,7 +47,20 @@ Set `network.health_path` to a private JSON file. `status` in the management roo
 shows last successful source refresh, queued sends and unavailable attachments.
 Source failure and Matrix delivery failure are separate fields. Check timestamps,
 not merely whether a process exists. Failures back off; the last captured archive
-remains usable. Normal polling is configured with `poll_seconds`.
+remains usable. Normal ChatGPT polling is configured with `poll_seconds` and does
+not slow down during idle periods. Local Codex reads run independently using
+`codex_poll_seconds` (default 10 seconds). Intervals are measured after each source
+finishes its collection and delivery work. A stalled refresh, failed reader, or
+backoff in one source does not pause the other. Local activity does not trigger
+ChatGPT collection, creation recovery, or remote outbox recovery.
+
+The health JSON includes separate `chatgpt` and (when enabled) `codex` timestamps,
+source/delivery availability and attachment counts. Inspect both sources: the
+aggregate `last_attempt` advances whenever either completes. Aggregate availability
+requires both enabled sources to succeed, and aggregate success timestamps reflect
+the older source success. `status` shows each source separately and checks each
+source's freshness, so fast local reads cannot hide a stalled ChatGPT collector.
+`retry` explicitly wakes both sources; normal replies wake only their source.
 
 Enable `matrix.message_error_notices` alongside `matrix.message_status_events`.
 The connector requests a visible notice replying to the failed original message;

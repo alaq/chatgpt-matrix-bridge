@@ -35,7 +35,18 @@ func splitSyncFailures(err error) (sourceErr, deliveryErr error) {
 	return nil, err
 }
 
+type sourceHealth struct {
+	LastAttempt         time.Time `json:"last_attempt"`
+	LastSourceSuccess   time.Time `json:"last_source_success"`
+	LastDeliverySuccess time.Time `json:"last_delivery_success"`
+	SourceAvailable     bool      `json:"source_available"`
+	DeliveryAvailable   bool      `json:"delivery_available"`
+	PendingAttachments  int       `json:"pending_attachments"`
+}
+
 type syncHealth struct {
+	ChatGPT             sourceHealth  `json:"chatgpt"`
+	Codex               *sourceHealth `json:"codex,omitempty"`
 	mu                  sync.Mutex
 	LastAttempt         time.Time `json:"last_attempt"`
 	LastSourceSuccess   time.Time `json:"last_source_success"`
@@ -47,17 +58,71 @@ type syncHealth struct {
 	Rooms               int       `json:"rooms"`
 }
 
-func (c *Client) recordHealth(ctx context.Context, sourceErr, deliveryErr error) {
+func (h *syncHealth) source(lane syncSource) *sourceHealth {
+	if lane == remoteSource {
+		return &h.ChatGPT
+	}
+	if h.Codex == nil {
+		h.Codex = &sourceHealth{}
+	}
+	return h.Codex
+}
+
+func (c *Client) resetPendingAttachments(lane syncSource) {
+	c.health.mu.Lock()
+	defer c.health.mu.Unlock()
+	c.health.source(lane).PendingAttachments = 0
+	c.health.sumAttachments()
+}
+
+func (c *Client) addPendingAttachments(lane syncSource, count int) {
+	c.health.mu.Lock()
+	defer c.health.mu.Unlock()
+	c.health.source(lane).PendingAttachments += count
+	c.health.sumAttachments()
+}
+
+func (h *syncHealth) sumAttachments() {
+	h.PendingAttachments = h.ChatGPT.PendingAttachments
+	if h.Codex != nil {
+		h.PendingAttachments += h.Codex.PendingAttachments
+	}
+}
+
+func (c *Client) recordSourceHealth(ctx context.Context, lane syncSource, sourceErr, deliveryErr error) {
 	h := &c.health
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.LastAttempt = time.Now().UTC()
-	h.SourceAvailable, h.DeliveryAvailable = sourceErr == nil, deliveryErr == nil
+	current := h.source(lane)
+	current.LastAttempt = time.Now().UTC()
+	current.SourceAvailable, current.DeliveryAvailable = sourceErr == nil, deliveryErr == nil
 	if sourceErr == nil {
-		h.LastSourceSuccess = h.LastAttempt
+		current.LastSourceSuccess = current.LastAttempt
 	}
 	if deliveryErr == nil {
-		h.LastDeliverySuccess = h.LastAttempt
+		current.LastDeliverySuccess = current.LastAttempt
+	}
+	h.LastAttempt = current.LastAttempt
+	h.SourceAvailable, h.DeliveryAvailable = h.ChatGPT.SourceAvailable, h.ChatGPT.DeliveryAvailable
+	sourceSuccess, deliverySuccess := h.ChatGPT.LastSourceSuccess, h.ChatGPT.LastDeliverySuccess
+	if c.connector.Config.LocalTasks().Enabled() {
+		local := h.source(localSource)
+		h.SourceAvailable = h.SourceAvailable && local.SourceAvailable
+		h.DeliveryAvailable = h.DeliveryAvailable && local.DeliveryAvailable
+		if local.LastSourceSuccess.Before(sourceSuccess) {
+			sourceSuccess = local.LastSourceSuccess
+		}
+		if local.LastDeliverySuccess.Before(deliverySuccess) {
+			deliverySuccess = local.LastDeliverySuccess
+		}
+	}
+	// Preserve aggregate compatibility without letting a fast local success hide
+	// a remote failure or continually advance the remote success timestamp.
+	if h.SourceAvailable {
+		h.LastSourceSuccess = sourceSuccess
+	}
+	if h.DeliveryAvailable {
+		h.LastDeliverySuccess = deliverySuccess
 	}
 	_ = c.connector.br.DB.QueryRow(ctx, "SELECT COUNT(*) FROM kv_store WHERE bridge_id=$1 AND key LIKE 'chatgpt_outbox_%' AND value<>''", c.connector.br.ID).Scan(&h.PendingSends)
 	c.cacheMu.RLock()
@@ -81,6 +146,22 @@ func (c *Client) recordHealth(ctx context.Context, sourceErr, deliveryErr error)
 	}
 }
 
+func sourceState(h *sourceHealth, interval time.Duration) string {
+	if h.LastAttempt.IsZero() {
+		return "starting"
+	}
+	if time.Since(h.LastAttempt) > max(5*time.Minute, 3*interval) {
+		return "sync delayed"
+	}
+	if !h.SourceAvailable {
+		return "source unavailable"
+	}
+	if !h.DeliveryAvailable {
+		return "delivery needs recovery"
+	}
+	return "connected"
+}
+
 func (c *Client) healthSummary() string {
 	c.health.mu.Lock()
 	defer c.health.mu.Unlock()
@@ -89,17 +170,11 @@ func (c *Client) healthSummary() string {
 	if !h.LastSourceSuccess.IsZero() {
 		when = h.LastSourceSuccess.Format(time.RFC3339)
 	}
-	state := "connected"
-	if h.LastAttempt.IsZero() {
-		state = "starting"
-	} else if !h.SourceAvailable {
-		state = "source unavailable; check the browser and local task reader"
-	} else if !h.DeliveryAvailable {
-		state = "delivery needs recovery"
-	} else if time.Since(h.LastAttempt) > max(5*time.Minute, 3*time.Duration(c.connector.Config.PollSeconds)*time.Second) {
-		state = "sync delayed"
+	sources := fmt.Sprintf("ChatGPT: %s", sourceState(&h.ChatGPT, time.Duration(c.connector.Config.PollSeconds)*time.Second))
+	if c.connector.Config.LocalTasks().Enabled() {
+		sources += fmt.Sprintf("\nCodex: %s", sourceState(h.source(localSource), c.connector.Config.localPollInterval()))
 	}
-	return fmt.Sprintf("Status: %s\nLast successful source sync: %s\nConversations: %d\nPending sends: %d\nUnavailable attachments: %d", state, when, h.Rooms, h.PendingSends, h.PendingAttachments)
+	return fmt.Sprintf("%s\nLast successful source sync: %s\nConversations: %d\nPending sends: %d\nUnavailable attachments: %d", sources, when, h.Rooms, h.PendingSends, h.PendingAttachments)
 }
 
 func (c *Connector) registerCommands() {
@@ -129,6 +204,7 @@ func (c *Connector) registerCommands() {
 			for _, login := range ce.User.GetUserLogins() {
 				if client, ok := login.Client.(*Client); ok {
 					client.requestRefresh()
+					requestWake(client.localRefreshRequested)
 				}
 			}
 			ce.Reply("Recovery requested. Pending sends will use their original attempts; an uncertain submission will not be sent again.")

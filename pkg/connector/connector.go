@@ -2,7 +2,6 @@ package connector
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -17,7 +16,6 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
-	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
 )
 
@@ -74,81 +72,33 @@ func (c *Connector) LoadUserLogin(_ context.Context, login *bridgev2.UserLogin) 
 	if !ok || string(login.ID) != "chatgpt_"+meta.AccountKey || meta.Since <= 0 {
 		return errors.New("invalid saved login identity")
 	}
-	client := &Client{login: login, connector: c, backend: c.Config.Backend(), chats: map[string]source.Conversation{}, refreshRequested: make(chan struct{}, 1)}
+	client := &Client{login: login, connector: c, backend: c.Config.Backend(), chats: map[string]source.Conversation{}, refreshRequested: make(chan struct{}, 1), localRefreshRequested: make(chan struct{}, 1)}
 	client.loginValid.Store(true)
 	login.Client = client
 	return nil
 }
 
 type Client struct {
-	health           syncHealth
-	login            *bridgev2.UserLogin
-	connector        *Connector
-	backend          source.Backend
-	connected        atomic.Bool
-	loginValid       atomic.Bool
-	pollMu           sync.Mutex
-	lifecycle        sync.Mutex
-	cancel           context.CancelFunc
-	cacheMu          sync.RWMutex
-	chats            map[string]source.Conversation
-	refreshRequested chan struct{}
-	sendFunc         func(context.Context, source.SendRequest) (*source.SendResult, error)
+	health                syncHealth
+	login                 *bridgev2.UserLogin
+	connector             *Connector
+	backend               source.Backend
+	connected             atomic.Bool
+	loginValid            atomic.Bool
+	pollMu                sync.Mutex
+	localPollMu           sync.Mutex
+	workers               sync.WaitGroup
+	lifecycle             sync.Mutex
+	cancel                context.CancelFunc
+	cacheMu               sync.RWMutex
+	chats                 map[string]source.Conversation
+	refreshRequested      chan struct{}
+	localRefreshRequested chan struct{}
+	candidates            [2][]source.Conversation
+	sendFunc              func(context.Context, source.SendRequest) (*source.SendResult, error)
 }
 
 var _ bridgev2.NetworkAPI = (*Client)(nil)
-
-func (c *Client) Connect(ctx context.Context) {
-	c.lifecycle.Lock()
-	defer c.lifecycle.Unlock()
-	if c.cancel != nil {
-		return
-	}
-	ctx, c.cancel = context.WithCancel(ctx)
-	go func() {
-		failures := 0
-		for {
-			if err := c.poll(ctx); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				failures++
-				c.connected.Store(false)
-				c.login.Log.Warn().Err(err).Msg("ChatGPT source synchronization paused")
-				c.login.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "chatgpt-source-unavailable", Message: "Source refresh is unavailable. Showing the last saved history; retries will back off automatically."})
-			} else {
-				failures = 0
-				c.connected.Store(true)
-				c.login.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
-			}
-			timer := time.NewTimer(nextPollDelay(time.Duration(c.connector.Config.PollSeconds)*time.Second, failures))
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-timer.C:
-			case <-c.refreshRequested:
-				timer.Stop()
-			}
-		}
-	}()
-}
-
-func (c *Client) requestRefresh() {
-	select {
-	case c.refreshRequested <- struct{}{}:
-	default:
-	}
-}
-func (c *Client) Disconnect() {
-	c.lifecycle.Lock()
-	defer c.lifecycle.Unlock()
-	if c.cancel != nil {
-		c.cancel()
-		c.cancel = nil
-	}
-	c.connected.Store(false)
-}
 
 // A persisted collector login remains configured across transient sync failures.
 // Every actual send independently verifies the fresh source account before any UI
@@ -165,84 +115,6 @@ func (c *Client) sourceAssistantID(chat source.Conversation) networkid.UserID {
 		return networkid.UserID(string(c.login.ID) + "_codex")
 	}
 	return c.assistantID()
-}
-
-func (c *Client) poll(ctx context.Context) (result error) {
-	c.pollMu.Lock()
-	defer c.pollMu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	c.health.mu.Lock()
-	c.health.PendingAttachments = 0
-	c.health.mu.Unlock()
-	refreshErr := c.backend.Refresh(ctx)
-	creationErr := c.recoverCreations(ctx)
-	// The account-bound archive remains useful while the source is unavailable.
-	// Finish local delivery/presentation updates, but report the refresh failure
-	// and back off instead of claiming that the source is synchronized.
-	defer func() {
-		sourceErr, deliveryErr := splitSyncFailures(result)
-		c.recordHealth(ctx, errors.Join(refreshErr, sourceErr), errors.Join(creationErr, deliveryErr))
-		result = errors.Join(refreshErr, creationErr, result)
-	}()
-	return c.deliverArchive(ctx)
-}
-
-func (c *Client) deliverArchive(ctx context.Context) error {
-	meta := c.login.Metadata.(*LoginMetadata)
-	known, err := c.loadDelivered(ctx)
-	if err != nil {
-		return err
-	}
-	var chats []source.Conversation
-	var failures []error
-	snapshot, err := c.backend.Read(ctx, known)
-	if err == nil {
-		chats, err = source.Select(snapshot, meta.AccountKey, meta.Since)
-	}
-	if err != nil {
-		failures = append(failures, sourceReadFailure{err})
-	}
-	local := c.connector.Config.LocalTasks()
-	if local.Enabled() {
-		// Persist source identity: a changed local store must never reuse old rooms.
-		key := "chatgpt_local_source_" + meta.AccountKey
-		identity := source.StableID("local-task-store-v1", local.Home)
-		var saved string
-		err = c.connector.br.DB.QueryRow(ctx, "SELECT value FROM kv_store WHERE bridge_id=$1 AND key=$2", c.connector.br.ID, key).Scan(&saved)
-		if errors.Is(err, sql.ErrNoRows) {
-			_, err = c.connector.br.DB.Exec(ctx, "INSERT INTO kv_store (bridge_id,key,value) VALUES ($1,$2,$3)", c.connector.br.ID, key, identity)
-			saved = identity
-		}
-		if err == nil && saved != identity {
-			err = errors.New("local task store changed; refusing to mix rooms")
-		}
-		if err == nil {
-			var tasks []source.Conversation
-			tasks, err = local.Read(ctx, meta.AccountKey, known)
-			chats = append(chats, tasks...)
-		}
-		if err != nil {
-			failures = append(failures, sourceReadFailure{err})
-		}
-	}
-	chats = c.connector.Config.selectActive(chats)
-	if len(failures) == 0 {
-		c.replaceActiveCache(meta.AccountKey, chats)
-	}
-	for _, chat := range chats {
-		if !c.connector.Config.allows(chat.ID) {
-			continue
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := c.dispatchConversation(ctx, chat); err != nil {
-			failures = append(failures, err)
-		}
-	}
-	return errors.Join(failures...)
 }
 
 const deliveryStatePrefix = "chatgpt_delivery_v1_"
@@ -388,9 +260,7 @@ func (c *Client) dispatch(ctx context.Context, chat source.Conversation) error {
 		}
 	}
 	if len(mediaFailures) > 0 {
-		c.health.mu.Lock()
-		c.health.PendingAttachments += len(mediaFailures)
-		c.health.mu.Unlock()
+		c.addPendingAttachments(conversationSource(chat.ID), len(mediaFailures))
 		c.login.Log.Warn().Int("attachments", len(mediaFailures)).Msg("Some source attachments remain unavailable; text synchronization continues")
 	}
 	if branchKey != "" {

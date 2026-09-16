@@ -16,9 +16,9 @@ func TestHealthSeparatesSourceOutageFromDeliveryAndDoesNotExportContent(t *testi
 	br, c := startFixture(t, filepath.Join(root, "bridge.db"), mx)
 	defer br.Stop()
 	c.connector.Config.HealthPath = filepath.Join(root, "health.json")
-	c.recordHealth(context.Background(), nil, nil)
+	c.recordSourceHealth(context.Background(), remoteSource, nil, nil)
 	previous := c.health.LastSourceSuccess
-	c.recordHealth(context.Background(), errors.New("private source diagnostic"), nil)
+	c.recordSourceHealth(context.Background(), remoteSource, errors.New("private source diagnostic"), nil)
 	data, err := os.ReadFile(c.connector.Config.HealthPath)
 	if err != nil {
 		t.Fatal(err)
@@ -41,11 +41,11 @@ func TestLocalReaderFailureDoesNotMisreportMatrixDelivery(t *testing.T) {
 	root := t.TempDir()
 	br, c := startFixture(t, filepath.Join(root, "bridge.db"), mx)
 	defer br.Stop()
-	c.recordHealth(context.Background(), nil, nil)
+	c.recordSourceHealth(context.Background(), remoteSource, nil, nil)
 	previous := c.health.LastSourceSuccess
 	readerErr := errors.New("local task source unavailable")
 	sourceErr, deliveryErr := splitSyncFailures(errors.Join(sourceReadFailure{readerErr}))
-	c.recordHealth(context.Background(), sourceErr, deliveryErr)
+	c.recordSourceHealth(context.Background(), remoteSource, sourceErr, deliveryErr)
 	if c.health.SourceAvailable || !c.health.DeliveryAvailable || !c.health.LastSourceSuccess.Equal(previous) {
 		t.Fatal("local reader failure was not classified as a source failure")
 	}

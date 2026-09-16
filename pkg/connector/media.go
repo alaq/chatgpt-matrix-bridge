@@ -27,9 +27,7 @@ func (c *Client) attachmentEvent(meta simplevent.EventMeta, chat source.Conversa
 			// That would consume this attachment's deterministic transaction before
 			// its actual file could be sent. Leave unavailable files retryable.
 			unavailable := func(err error) (*bridgev2.ConvertedMessage, error) {
-				c.health.mu.Lock()
-				c.health.PendingAttachments++
-				c.health.mu.Unlock()
+				c.addPendingAttachments(conversationSource(chat.ID), 1)
 				return nil, errors.Join(bridgev2.ErrIgnoringRemoteEvent, err)
 			}
 			if err := c.recoverOutbound(ctx, portal); err != nil {

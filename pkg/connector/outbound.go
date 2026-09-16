@@ -234,7 +234,7 @@ func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMe
 	out.AttachmentIDs = result.AttachmentIDs
 	return &bridgev2.MatrixMessageResponse{DB: c.outboundMessage(msg.Portal, out, result.UserMessageID), PostSave: func(ctx context.Context, _ *database.Message) {
 		_ = c.setOutbound(ctx, msg.Portal, nil)
-		c.requestRefresh()
+		c.requestConversationRefresh(chat.ID)
 		c.observeGeneration(msg.Portal, chat.ID)
 	}}, nil
 }

@@ -19,7 +19,8 @@ history. Project matching and vault project links are outside this bridge.
   do not merge rooms. Vault project matching is independent of room creation.
 - The first login stores an activation timestamp. It survives normal restarts and
   relogin; set `network.since` before first login to include an older window.
-- Each poll runs the existing bounded incremental collector, then reads a snapshot.
+- Each ChatGPT poll runs the existing bounded incremental collector, then reads a snapshot.
+  Local Codex reads run independently and never wake that remote collector.
   Only the ten most recently updated eligible conversations are active by default,
   across ChatGPT, Work and Codex combined. Older room mappings and history remain;
   updating an older source conversation brings its existing room back into the
@@ -29,9 +30,11 @@ history. Project matching and vault project links are outside this bridge.
   marker instead of reopening/decoding that transcript or redispatching its events.
   Failed or partial delivery never advances the fingerprint; outbox recovery and
   running-task typing refresh still happen on every applicable poll.
-  Default polling is 60 seconds plus collection/delivery time, not a latency SLA.
-  Failed polls back off from at least one minute to 15 minutes (or a longer configured
-  interval). Last captured, account-bound history remains available for local delivery
+  Default ChatGPT polling is 60 seconds (`poll_seconds`), plus collection/delivery
+  time. Existing configured intervals are preserved; there is no idle slowdown.
+  Local Codex polling defaults to 10 seconds (`codex_poll_seconds`).
+  Each failing source backs off independently from at least one minute to 15 minutes
+  (or a longer configured interval); this is failure recovery, not normal discovery. Last captured, account-bound history remains available for local delivery
   and presentation updates while refresh is unavailable; status stays disconnected.
   A transient refresh failure does not invalidate the configured login or discard
   follow-ups. Actual sending still verifies the fresh source account before submission.
@@ -201,7 +204,14 @@ them. `health_path` writes private timestamps/counts, including pending attachme
 ## Local Work/Codex pilot
 
 Configure `codex_home`, `codex_adapter` (this repository's `scripts/codex_source.py`),
-`codex_journal` and a separate RFC3339 `codex_since` activation date. The adapter
+`codex_journal` and a separate RFC3339 `codex_since` activation date.
+`codex_poll_seconds` controls local reads (default 10; zero also selects the default).
+A slow or failed ChatGPT refresh does not block these reads, and a failed local
+reader does not delay ChatGPT discovery. Local replies wake only the local reader;
+ChatGPT replies and generation completion wake only the remote collector. Both
+use one combined active-conversation cap, with separately bounded source metadata.
+
+The adapter
 selects the newest configured task rows before opening rollout files, excluding
 reasoning, tool calls, subagents and archived tasks from the exported messages. New or continued tasks appear as `Codex · …` rooms;
 completed visible progress and answers are mirrored. Source IDs are `codex:<UUID>`,
